@@ -77,7 +77,7 @@ def active_thread() -> dict | None:
 
 def send_message(user_message: str) -> dict:
     """POST to /studio/{assistant_id} and return the response dict."""
-    url = f"{st.session_state.base_url.rstrip('/')}/studio/{assistant_id}"
+    url = f"{st.session_state.base_url.rstrip('/')}/message/{assistant_id}"
     headers = {
         "Content-Type": "application/json",
         "api-key": st.session_state.api_key,
