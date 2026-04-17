@@ -76,7 +76,7 @@ def _base() -> str:
 def _headers(json_body: bool = False) -> dict:
     h: dict = {"api-key": st.session_state.api_key}
     if json_body:
-        h["Content-Type"] = "application/json"
+        h["Content-Type"] = "multipart/form-data"
     return h
 
 def fetch_user_id() -> str:
@@ -116,13 +116,12 @@ def api_send_message(user_message: str, thread_id: str | None = None) -> dict:
         "your_name": st.session_state.user_name or None,
         "your_description": st.session_state.user_description or None,
         "conversation_title": title,
+        "thread_id": real_thread_id
     }
-    params = {"thread_id": real_thread_id} if real_thread_id else {}
     resp = requests.post(
         f"{_base()}/message/{assistant_id}",
-        headers=_headers(json_body=True),
-        json=payload,
-        params=params,
+        headers=_headers(),
+        data=payload,
         timeout=None,
     )
     resp.raise_for_status()
@@ -210,31 +209,39 @@ if has_api_key and st.session_state.last_loaded_api_key != st.session_state.api_
     st.session_state.pending_auto_message = None
     st.session_state.last_loaded_api_key = st.session_state.api_key
 
-# ── 3. API-key mode: load threads + open most recent ──
+# ── 3. API-key mode: load threads + restore active thread ──
 if has_api_key and cfg_ok:
-    if not st.session_state.threads_loaded:
+    if not st.session_state.threads_loaded or st.session_state.last_loaded_api_key != st.session_state.api_key:
         try:
             threads = fetch_threads(assistant_id)
             st.session_state.backend_threads = threads
             st.session_state.threads_loaded = True
-            # Auto-select most recent thread
-            if threads and st.session_state.active_thread_id is None:
+            st.session_state.last_loaded_api_key = st.session_state.api_key
+
+            # Smart restore of active thread
+            if st.session_state.active_thread_id and st.session_state.active_thread_id != NEW_THREAD:
+                if not any(t["thread_id"] == st.session_state.active_thread_id for t in threads):
+                    if threads:
+                        st.session_state.active_thread_id = threads[0]["thread_id"]
+            elif threads and (st.session_state.active_thread_id is None or st.session_state.active_thread_id == NEW_THREAD):
                 st.session_state.active_thread_id = threads[0]["thread_id"]
         except Exception as exc:
             st.error(f"❌ Failed to load conversations: {exc}")
 
-    # ── 4. Load messages for the active thread ──
+    # Load messages for active thread
     tid = st.session_state.active_thread_id
     if tid and tid != NEW_THREAD and tid not in st.session_state.thread_messages:
         try:
             raw = fetch_thread_messages(tid, assistant_id)
-            msgs = convert_lg_messages(raw)
-            st.session_state.thread_messages[tid] = msgs
-            if not msgs:
-                st.session_state.pending_auto_message = AUTO_GREETING
+            st.session_state.thread_messages[tid] = convert_lg_messages(raw)
         except Exception:
             st.session_state.thread_messages[tid] = []
-            st.session_state.pending_auto_message = AUTO_GREETING
+
+# ── 4. Anonymous mode fallback (only if no API key)
+elif not has_api_key and cfg_ok and st.session_state.active_thread_id is None:
+    st.session_state.active_thread_id = NEW_THREAD
+    st.session_state.thread_messages[NEW_THREAD] = []
+    st.session_state.pending_auto_message = AUTO_GREETING
 
 # ── 5. Anonymous mode: open a fresh conversation window ──
 elif not has_api_key and cfg_ok and st.session_state.active_thread_id is None:
@@ -477,32 +484,32 @@ if st.session_state.pending_auto_message and not user_input:
 
 # ── Process message ──
 if user_input:
-    # Display immediately
+    # Use the already-resolved tid from above (don't re-assign here)
+    current_tid = tid  # this 'tid' comes from the line before the header
+
+    # Display user message immediately
     with st.chat_message("user", avatar="🧑"):
         st.markdown(user_input)
 
-    # Append to local state
+    # Append user message locallygytf65
+    messages = st.session_state.thread_messages.get(current_tid, [])
     messages.append({"role": "user", "content": user_input, "response_time_ms": None})
-    st.session_state.thread_messages[tid] = messages
+    st.session_state.thread_messages[current_tid] = messages
 
     # Send to API
     with st.chat_message("assistant", avatar="🤖"):
         with st.spinner("Thinking…"):
             try:
-                result = api_send_message(user_input, thread_id=tid)
-
+                result = api_send_message(user_input, thread_id=current_tid)
                 reply = result.get("content", "(empty response)")
                 resp_time = result.get("total_response_time_ms")
                 returned_tid = result.get("thread_id")
 
                 st.markdown(reply)
                 if resp_time:
-                    st.markdown(
-                        f'<span class="resp-time">⏱ {resp_time} ms</span>',
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown(f'<span class="resp-time">⏱ {resp_time} ms</span>', unsafe_allow_html=True)
 
-                # Persist assistant reply
+                # Append assistant reply
                 messages.append({
                     "role": "assistant",
                     "content": reply,
@@ -510,29 +517,32 @@ if user_input:
                     "metadata": result.get("response_metadata", {}),
                 })
 
-                # ── Promote __new__ → real thread_id ──
-                if returned_tid and tid == NEW_THREAD:
-                    # Move message history to the real thread_id
-                    st.session_state.thread_messages[returned_tid] = messages
-                    del st.session_state.thread_messages[NEW_THREAD]
-                    st.session_state.active_thread_id = returned_tid
+                # === FIXED THREAD PROMOTION ===
+                final_tid = returned_tid or current_tid
 
-                    # In api_key mode, refresh the thread list so it appears in the sidebar
-                    if has_api_key and cfg_ok:
-                        try:
-                            st.session_state.backend_threads = fetch_threads(assistant_id)
-                        except Exception:
-                            pass
-                    # Set a sensible default title from the first user message if none set
-                    if returned_tid not in st.session_state.conversation_titles:
-                        short = user_input[:42] + ("…" if len(user_input) > 42 else "")
-                        st.session_state.conversation_titles[returned_tid] = short
+                if final_tid:
+                    if current_tid == NEW_THREAD or current_tid is None or current_tid != final_tid:
+                        # Promote / move to real thread
+                        st.session_state.thread_messages[final_tid] = messages
+                        if current_tid in st.session_state.thread_messages and current_tid != final_tid:
+                            del st.session_state.thread_messages[current_tid]
+                        st.session_state.active_thread_id = final_tid
 
-                elif returned_tid and tid != returned_tid:
-                    # thread_id changed unexpectedly — follow it
-                    st.session_state.thread_messages[returned_tid] = messages
-                    st.session_state.thread_messages.pop(tid, None)
-                    st.session_state.active_thread_id = returned_tid
+                        # Refresh sidebar
+                        if has_api_key and cfg_ok:
+                            try:
+                                st.session_state.backend_threads = fetch_threads(assistant_id)
+                            except Exception:
+                                pass
+
+                    # Default title
+                    if final_tid not in st.session_state.conversation_titles:
+                        short = user_input[:45] + ("…" if len(user_input) > 45 else "")
+                        st.session_state.conversation_titles[final_tid] = short
+
+                # Safety
+                if not st.session_state.active_thread_id:
+                    st.session_state.active_thread_id = final_tid
 
             except requests.exceptions.ConnectionError:
                 st.error(f"❌ Could not connect to `{st.session_state.base_url}`. Is the server running?")
