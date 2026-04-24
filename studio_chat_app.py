@@ -491,7 +491,7 @@ if user_input:
     with st.chat_message("user", avatar="🧑"):
         st.markdown(user_input)
 
-    # Append user message locallygytf65
+    # Append user message 
     messages = st.session_state.thread_messages.get(current_tid, [])
     messages.append({"role": "user", "content": user_input, "response_time_ms": None})
     st.session_state.thread_messages[current_tid] = messages
