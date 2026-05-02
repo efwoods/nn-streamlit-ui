@@ -6,6 +6,7 @@ Run with:
     streamlit run studio_chat_app.py
 """
 import json
+import io
 import requests
 from datetime import datetime
 import streamlit as st
@@ -61,6 +62,8 @@ DEFAULTS = {
     # UI
     "show_settings": False,
     "pending_auto_message": None,
+    # Increment to reset st.file_uploader after a successful attachment send
+    "attachment_uploader_bump": 0,
     # Full data URI or https URL for assistant avatar (from GET /avatar_reference_image)
     "assistant_reference_icon": None,
     "_ref_icon_cache_key": None,
@@ -162,8 +165,16 @@ def upload_avatar_reference_image_url(image_url: str) -> None:
     resp.raise_for_status()
 
 
-def api_send_message(user_message: str, thread_id: str | None = None) -> dict:
-    """POST /message/{assistant_id}  →  {content, thread_id, total_response_time_ms, …}"""
+def api_send_message(
+    user_message: str,
+    thread_id: str | None = None,
+    attachments: list | None = None,
+) -> dict:
+    """POST /message/{assistant_id}  →  {content, thread_id, total_response_time_ms, …}
+
+    With attachments, sends multipart/form-data (same ``files`` field pattern as
+    ``update_avatar_identity_with_media``).
+    """
     real_thread_id = None if (thread_id is None or thread_id == NEW_THREAD) else thread_id
     title = st.session_state.conversation_titles.get(thread_id) if thread_id else None
     payload = {
@@ -171,16 +182,65 @@ def api_send_message(user_message: str, thread_id: str | None = None) -> dict:
         "your_name": st.session_state.user_name or None,
         "your_description": st.session_state.user_description or None,
         "conversation_title": title,
-        "thread_id": real_thread_id
+        "thread_id": real_thread_id,
     }
-    resp = requests.post(
-        f"{_base()}/message/{assistant_id}",
-        headers=_headers(),
-        data=payload,
-        timeout=None,
-    )
+    url = f"{_base()}/message/{assistant_id}"
+    if attachments:
+        files = [
+            (
+                "files",
+                (
+                    uf.name,
+                    uf.getvalue(),
+                    uf.type or "application/octet-stream",
+                ),
+            )
+            for uf in attachments
+        ]
+        resp = requests.post(
+            url,
+            headers=_headers(),
+            data={k: v for k, v in payload.items() if v is not None},
+            files=files,
+            timeout=None,
+        )
+    else:
+        resp = requests.post(
+            url,
+            headers=_headers(),
+            data=payload,
+            timeout=None,
+        )
     resp.raise_for_status()
     return resp.json()
+
+
+def _preview_attachment_bar(uploaded_file) -> None:
+    """Inline preview for the composer (image thumbnail or file caption)."""
+    if uploaded_file.type and uploaded_file.type.startswith("image/"):
+        st.image(io.BytesIO(uploaded_file.getvalue()), width=min(220, 320))
+    else:
+        size_kb = len(uploaded_file.getbuffer()) / 1024.0
+        st.caption(f"📎 **{uploaded_file.name}** — {size_kb:.1f} KB")
+
+
+def _render_user_chat_content(msg: dict) -> None:
+    """User bubble body: optional attachment preview + text (same shape as stored messages)."""
+    att = msg.get("attachment_meta")
+    text = (msg.get("content") or "").strip()
+    if att:
+        mime = att.get("mime") or ""
+        name = att.get("name", "attachment")
+        if mime.startswith("image/") and att.get("bytes"):
+            st.image(io.BytesIO(att["bytes"]), width=min(280, 360))
+        elif mime.startswith("image/"):
+            st.caption(f"🖼️ {name}")
+        else:
+            st.caption(f"📎 {name}")
+    if text:
+        st.markdown(text)
+    elif att:
+        st.caption("_Attachment only._")
 
 # ──────────────────────────────────────────────
 # Conversion / display helpers
@@ -250,6 +310,16 @@ def assistant_chat_avatar() -> str:
         if s.startswith("https://") or s.startswith("http://") or s.startswith("data:image"):
             return s
     return "🤖"
+
+
+def invalidate_avatar_icon_cache() -> None:
+    """Force GET /avatar_reference_image on next render (e.g. after upload)."""
+    st.session_state._ref_icon_cache_key = None
+
+
+def _toggle_settings() -> None:
+    st.session_state.show_settings = not st.session_state.show_settings
+
 
 # ──────────────────────────────────────────────
 # Startup / initialization logic
@@ -350,6 +420,116 @@ div[data-testid="stSidebar"] .stButton > button {
     border: 1px solid #333;
     margin-top: 4px;
 }
+/* Composer rows: attach column + message shell */
+section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="column"]:first-child {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+}
+/*
+ * Nested [text | submit]: shell is position:relative; submit column is position:absolute
+ * inside the same rounded bar as the text field (not a sibling strip beside it).
+ */
+section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="column"]:nth-child(2) [data-testid="stHorizontalBlock"],
+section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="column"]:nth-child(2) [class*="stHorizontalBlock"] {
+    position: relative !important;
+    gap: 0 !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    border-radius: 12px;
+    border: 1px solid rgba(250, 250, 250, 0.14);
+    background: rgba(255, 255, 255, 0.06);
+    padding: 4px 10px 4px 12px !important;
+    box-sizing: border-box !important;
+    min-height: 2.65rem !important;
+}
+section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="column"]:nth-child(2) div[data-testid="column"]:first-child {
+    flex: 1 1 auto !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    padding-right: 3rem !important;
+}
+section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="column"]:nth-child(2) div[data-testid="column"]:first-child .stTextInput > div {
+    border: none !important;
+    background: transparent !important;
+}
+section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="column"]:nth-child(2) div[data-testid="column"]:first-child input {
+    border: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
+    padding-left: 2px !important;
+}
+/* Submit sits inside the bar; zero flex width so text column spans full shell */
+section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="column"]:nth-child(2) div[data-testid="column"]:last-child {
+    position: absolute !important;
+    right: 6px !important;
+    top: 50% !important;
+    transform: translateY(-50%) !important;
+    width: 0 !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    overflow: visible !important;
+    flex: 0 0 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    z-index: 3 !important;
+}
+section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="column"]:nth-child(2) div[data-testid="column"]:last-child .stButton {
+    margin: 0 !important;
+}
+section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="column"]:nth-child(2) div[data-testid="column"]:last-child .stButton > button {
+    width: 2.65rem !important;
+    min-height: 2.35rem !important;
+    height: auto !important;
+    padding: 0 !important;
+    border-radius: 10px !important;
+    border: none !important;
+    font-size: 1.15rem !important;
+    line-height: 1 !important;
+}
+/* Reserve scroll space above the docked composer */
+section[data-testid="stMain"] .block-container {
+    padding-bottom: clamp(9rem, 20vh, 14rem) !important;
+}
+/*
+ * Pin only the inner <form>, not the outer stForm wrapper. Styling the wrapper with
+ * position:fixed + background can stretch to the full main column and cover the app.
+ */
+section[data-testid="stMain"] div[data-testid="stForm"] {
+    position: static !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+}
+section[data-testid="stMain"] div[data-testid="stForm"] form {
+    position: fixed !important;
+    z-index: 1001;
+    bottom: 0;
+    right: 0;
+    margin: 0 !important;
+    padding: 0.65rem 1.25rem calc(0.85rem + env(safe-area-inset-bottom, 0px)) 1.25rem !important;
+    border-top: 1px solid rgba(250, 250, 250, 0.12);
+    box-shadow: 0 -6px 28px rgba(0, 0, 0, 0.35);
+    background: var(--secondary-background-color, #262730);
+    width: calc(100vw - var(--sidebar-width, 21rem)) !important;
+    max-width: none !important;
+    box-sizing: border-box;
+    max-height: min(50vh, 420px);
+    overflow-y: auto;
+}
+body:has([data-testid="stSidebar"][aria-expanded="false"]) section[data-testid="stMain"] div[data-testid="stForm"] form {
+    width: calc(100vw - 4.5rem) !important;
+}
+@media (max-width: 768px) {
+    section[data-testid="stMain"] div[data-testid="stForm"] form {
+        width: 100vw !important;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -361,8 +541,12 @@ with st.sidebar:
     with col_title:
         st.markdown("### 🤖 Studio Chat")
     with col_gear:
-        if st.button("⚙️", key="gear_btn", help="Open settings"):
-            st.session_state.show_settings = not st.session_state.show_settings
+        st.button(
+            "⚙️",
+            key="gear_btn",
+            help="Open settings",
+            on_click=_toggle_settings,
+        )
 
     # ── Settings panel ──
     if st.session_state.show_settings:
@@ -375,6 +559,7 @@ with st.sidebar:
             placeholder="your-api-key",
             key="input_api_key",
         )
+        settings_has_api_key = bool(st.session_state.api_key.strip())
         st.markdown("**🔗 Assistant ID** *(from URL)*")
         if assistant_id:
             st.code(assistant_id, language=None)
@@ -391,6 +576,47 @@ with st.sidebar:
             key="input_user_desc",
             height=80,
         )
+
+        if settings_has_api_key and cfg_ok:
+            st.markdown("---")
+            st.markdown("**🖼️ Avatar reference portrait**")
+            st.caption(
+                "Upload a clear face photo so the assistant icon uses it (stored server-side). "
+                "Max file size: 25 MB (see `.streamlit/config.toml`)."
+            )
+            ref_up = st.file_uploader(
+                "Reference image",
+                type=["png", "jpg", "jpeg", "webp", "gif"],
+                key="reference_image_upload",
+                label_visibility="collapsed",
+            )
+            if ref_up and st.button("Upload reference image", key="btn_upload_ref_img"):
+                try:
+                    upload_avatar_reference_image(ref_up)
+                    invalidate_avatar_icon_cache()
+                    st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
+                    st.success("Reference image uploaded.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Upload failed: {exc}")
+            ref_url = st.text_input(
+                "Or image URL",
+                placeholder="https://…",
+                key="reference_image_url_input",
+            )
+            if ref_url.strip() and st.button("Use image URL", key="btn_ref_url"):
+                try:
+                    upload_avatar_reference_image_url(ref_url)
+                    invalidate_avatar_icon_cache()
+                    st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
+                    st.success("Reference image URL saved.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"URL upload failed: {exc}")
+        elif cfg_ok and not settings_has_api_key:
+            st.markdown("---")
+            st.caption("🖼️ **Avatar reference** requires an API key — add one above.")
+
         if st.button("✅ Save & Close", key="save_settings"):
             st.session_state.show_settings = False
             st.rerun()
@@ -461,40 +687,6 @@ with st.sidebar:
                         st.rerun()
     elif not has_api_key:
         st.caption("💡 Add an API key to load your full conversation history.")
-
-    if has_api_key and cfg_ok:
-        st.markdown("---")
-        st.markdown("**🖼️ Avatar reference portrait**")
-        st.caption(
-            "Upload a clear face photo so the assistant icon uses it (stored server-side)."
-        )
-        ref_up = st.file_uploader(
-            "Reference image",
-            type=["png", "jpg", "jpeg", "webp", "gif"],
-            key="reference_image_upload",
-            label_visibility="collapsed",
-        )
-        if ref_up and st.button("Upload reference image", key="btn_upload_ref_img"):
-            try:
-                upload_avatar_reference_image(ref_up)
-                st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
-                st.success("Reference image uploaded.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Upload failed: {exc}")
-        ref_url = st.text_input(
-            "Or image URL",
-            placeholder="https://…",
-            key="reference_image_url_input",
-        )
-        if ref_url.strip() and st.button("Use image URL", key="btn_ref_url"):
-            try:
-                upload_avatar_reference_image_url(ref_url)
-                st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
-                st.success("Reference image URL saved.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"URL upload failed: {exc}")
 
     # ── Export ──
     all_exportable = {
@@ -578,40 +770,103 @@ for msg in messages:
     role = msg["role"]
     _av = "🧑" if role == "user" else assistant_chat_avatar()
     with st.chat_message(role, avatar=_av):
-        st.markdown(msg["content"])
+        if role == "user" and msg.get("attachment_meta"):
+            _render_user_chat_content(msg)
+        else:
+            st.markdown(msg["content"])
         if role == "assistant" and msg.get("response_time_ms"):
             st.markdown(
                 f'<span class="resp-time">⏱ {msg["response_time_ms"]} ms</span>',
                 unsafe_allow_html=True,
             )
 
-# ── Resolve message to send this render (auto-greeting or user input) ──
+# ── Message composer: one row [attach | type message | send] + preview inside form ──
+composer_disabled = bool(errors)
 placeholder = "Type your message…" if not errors else "Fix configuration errors before chatting."
-user_input = st.chat_input(placeholder, disabled=bool(errors))
+_uploader_key = f"msg_attachment_{st.session_state.attachment_uploader_bump}"
 
-if st.session_state.pending_auto_message and not user_input:
-    user_input = st.session_state.pending_auto_message
+attachment = None
+msg_field = ""
+submitted = False
+with st.form("message_bar", clear_on_submit=True):
+    bar = st.columns([1.35, 22])
+    with bar[0]:
+        attachment = st.file_uploader(
+            "📎",
+            label_visibility="collapsed",
+            key=_uploader_key,
+            disabled=composer_disabled,
+            help="Attach a file",
+        )
+    with bar[1]:
+        inner = st.columns([18, 2], gap="small")
+        with inner[0]:
+            msg_field = st.text_input(
+                "Message",
+                placeholder=placeholder,
+                label_visibility="collapsed",
+                disabled=composer_disabled,
+                key="message_bar_text",
+            )
+        with inner[1]:
+            submitted = st.form_submit_button(
+                "➤",
+                disabled=composer_disabled,
+                use_container_width=True,
+                help="Send",
+            )
+    if attachment:
+        _preview_attachment_bar(attachment)
+
+text = ""
+auto_from_pending = False
+if submitted:
+    text = (msg_field or "").strip()
+elif st.session_state.pending_auto_message:
+    text = st.session_state.pending_auto_message.strip()
     st.session_state.pending_auto_message = None
+    auto_from_pending = True
+
+should_send = auto_from_pending or (submitted and (bool(text) or bool(attachment)))
 
 # ── Process message ──
-if user_input:
+if should_send:
     # Use the already-resolved tid from above (don't re-assign here)
     current_tid = tid  # this 'tid' comes from the line before the header
 
+    files_payload = [attachment] if attachment else None
+
+    save_meta = None
+    display_msg: dict = {"content": text, "attachment_meta": None}
+    if attachment:
+        mime = attachment.type or ""
+        save_meta = {
+            "name": attachment.name,
+            "mime": mime,
+        }
+        if mime.startswith("image/"):
+            save_meta["bytes"] = attachment.getvalue()
+        display_msg["attachment_meta"] = save_meta
+
     # Display user message immediately
     with st.chat_message("user", avatar="🧑"):
-        st.markdown(user_input)
+        _render_user_chat_content(display_msg)
 
-    # Append user message 
+    # Append user message
     messages = st.session_state.thread_messages.get(current_tid, [])
-    messages.append({"role": "user", "content": user_input, "response_time_ms": None})
+    messages.append({
+        "role": "user",
+        "content": text,
+        "response_time_ms": None,
+        "attachment_meta": save_meta,
+    })
     st.session_state.thread_messages[current_tid] = messages
 
     # Send to API
     with st.chat_message("assistant", avatar=assistant_chat_avatar()):
         with st.spinner("Thinking…"):
             try:
-                result = api_send_message(user_input, thread_id=current_tid)
+                result = api_send_message(text, thread_id=current_tid, attachments=files_payload)
                 reply = result.get("content", "(empty response)")
                 resp_time = result.get("total_response_time_ms")
                 returned_tid = result.get("thread_id")
@@ -648,12 +903,16 @@ if user_input:
 
                     # Default title
                     if final_tid not in st.session_state.conversation_titles:
-                        short = user_input[:45] + ("…" if len(user_input) > 45 else "")
+                        title_src = text if text else (attachment.name if attachment else "")
+                        short = title_src[:45] + ("…" if len(title_src) > 45 else "")
                         st.session_state.conversation_titles[final_tid] = short
 
                 # Safety
                 if not st.session_state.active_thread_id:
                     st.session_state.active_thread_id = final_tid
+
+                if attachment:
+                    st.session_state.attachment_uploader_bump += 1
 
             except requests.exceptions.ConnectionError:
                 st.error(f"❌ Could not connect to `{st.session_state.base_url}`. Is the server running?")

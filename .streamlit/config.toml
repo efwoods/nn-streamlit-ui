@@ -1,0 +1,3 @@
+# Upload limit for st.file_uploader (megabytes). Default Streamlit is 200.
+[server]
+maxUploadSize = 25
