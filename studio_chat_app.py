@@ -5,6 +5,7 @@ A Streamlit chat interface for the /studio/{assistant_id} API endpoint.
 Run with:
     streamlit run studio_chat_app.py
 """
+import base64
 import json
 import io
 import requests
@@ -245,6 +246,17 @@ def _render_user_chat_content(msg: dict) -> None:
 # ──────────────────────────────────────────────
 # Conversion / display helpers
 # ──────────────────────────────────────────────
+
+def _json_export_sanitize(obj):
+    """Deep-copy structures for JSON export; encode binary blobs as base64 text."""
+    if isinstance(obj, bytes):
+        return base64.standard_b64encode(obj).decode("ascii")
+    if isinstance(obj, dict):
+        return {k: _json_export_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_export_sanitize(v) for v in obj]
+    return obj
+
 
 def convert_lg_messages(lg_messages: list) -> list:
     """Map LangGraph {type:'human'|'ai'} messages to {role:'user'|'assistant'}."""
@@ -698,7 +710,7 @@ with st.sidebar:
         st.markdown("---")
         st.download_button(
             "⬇️ Export messages",
-            data=json.dumps(all_exportable, indent=2),
+            data=json.dumps(_json_export_sanitize(all_exportable), indent=2),
             file_name="studio_threads.json",
             mime="application/json",
             use_container_width=True,
