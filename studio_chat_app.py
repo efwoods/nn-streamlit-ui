@@ -61,6 +61,9 @@ DEFAULTS = {
     # UI
     "show_settings": False,
     "pending_auto_message": None,
+    # Full data URI or https URL for assistant avatar (from GET /avatar_reference_image)
+    "assistant_reference_icon": None,
+    "_ref_icon_cache_key": None,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -106,6 +109,58 @@ def fetch_thread_messages(thread_id: str, assistant_id: str) -> list:
     )
     resp.raise_for_status()
     return resp.json().get("messages", [])
+
+def fetch_avatar_reference_icon() -> str | None:
+    """GET /avatar_reference_image — returns data:image…;base64,… or an https URL string."""
+    resp = requests.get(
+        f"{_base()}/avatar_reference_image",
+        headers=_headers(),
+        params={"assistant_id": assistant_id},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("reference_image_data")
+    return data if data else None
+
+
+def upload_avatar_reference_image(uploaded_file) -> None:
+    """POST /update_avatar_identity_with_media with reference_image=true."""
+    files = [
+        (
+            "files",
+            (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type or "image/jpeg"),
+        )
+    ]
+    data = {
+        "assistant_id": assistant_id,
+        "reference_image": "true",
+        "reference_audio": "false",
+    }
+    resp = requests.post(
+        f"{_base()}/update_avatar_identity_with_media",
+        headers=_headers(),
+        files=files,
+        data=data,
+        timeout=None,
+    )
+    resp.raise_for_status()
+
+
+def upload_avatar_reference_image_url(image_url: str) -> None:
+    data = {
+        "assistant_id": assistant_id,
+        "reference_image": "true",
+        "reference_audio": "false",
+        "url": image_url.strip(),
+    }
+    resp = requests.post(
+        f"{_base()}/update_avatar_identity_with_media",
+        headers=_headers(),
+        data=data,
+        timeout=None,
+    )
+    resp.raise_for_status()
+
 
 def api_send_message(user_message: str, thread_id: str | None = None) -> dict:
     """POST /message/{assistant_id}  →  {content, thread_id, total_response_time_ms, …}"""
@@ -186,12 +241,32 @@ def validate_settings() -> list[str]:
         errors.append("No `?assistant_id=` in URL — e.g. `?assistant_id=abc123`")
     return errors
 
+
+def assistant_chat_avatar() -> str:
+    """Small portrait for assistant bubbles: reference image if available, else robot emoji."""
+    ref = st.session_state.get("assistant_reference_icon")
+    if isinstance(ref, str) and ref.strip():
+        s = ref.strip()
+        if s.startswith("https://") or s.startswith("http://") or s.startswith("data:image"):
+            return s
+    return "🤖"
+
 # ──────────────────────────────────────────────
 # Startup / initialization logic
 # (runs every Streamlit render pass)
 # ──────────────────────────────────────────────
 has_api_key = bool(st.session_state.api_key.strip())
 cfg_ok = bool(st.session_state.base_url.strip() and assistant_id)
+
+# ── 0. Reference portrait for assistant avatar (works for anonymous chat too) ──
+if cfg_ok:
+    _rk = f"{assistant_id}:{st.session_state.api_key}"
+    if st.session_state.get("_ref_icon_cache_key") != _rk:
+        try:
+            st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
+        except Exception:
+            st.session_state.assistant_reference_icon = None
+        st.session_state._ref_icon_cache_key = _rk
 
 # ── 1. Resolve user_id (no api_key required) ──
 if not st.session_state.user_id and cfg_ok:
@@ -208,6 +283,7 @@ if has_api_key and st.session_state.last_loaded_api_key != st.session_state.api_
     st.session_state.active_thread_id = None
     st.session_state.pending_auto_message = None
     st.session_state.last_loaded_api_key = st.session_state.api_key
+    st.session_state._ref_icon_cache_key = None
 
 # ── 3. API-key mode: load threads + restore active thread ──
 if has_api_key and cfg_ok:
@@ -386,6 +462,40 @@ with st.sidebar:
     elif not has_api_key:
         st.caption("💡 Add an API key to load your full conversation history.")
 
+    if has_api_key and cfg_ok:
+        st.markdown("---")
+        st.markdown("**🖼️ Avatar reference portrait**")
+        st.caption(
+            "Upload a clear face photo so the assistant icon uses it (stored server-side)."
+        )
+        ref_up = st.file_uploader(
+            "Reference image",
+            type=["png", "jpg", "jpeg", "webp", "gif"],
+            key="reference_image_upload",
+            label_visibility="collapsed",
+        )
+        if ref_up and st.button("Upload reference image", key="btn_upload_ref_img"):
+            try:
+                upload_avatar_reference_image(ref_up)
+                st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
+                st.success("Reference image uploaded.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Upload failed: {exc}")
+        ref_url = st.text_input(
+            "Or image URL",
+            placeholder="https://…",
+            key="reference_image_url_input",
+        )
+        if ref_url.strip() and st.button("Use image URL", key="btn_ref_url"):
+            try:
+                upload_avatar_reference_image_url(ref_url)
+                st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
+                st.success("Reference image URL saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"URL upload failed: {exc}")
+
     # ── Export ──
     all_exportable = {
         tid: msgs
@@ -466,7 +576,8 @@ if errors:
 # ── Render existing messages ──
 for msg in messages:
     role = msg["role"]
-    with st.chat_message(role, avatar="🧑" if role == "user" else "🤖"):
+    _av = "🧑" if role == "user" else assistant_chat_avatar()
+    with st.chat_message(role, avatar=_av):
         st.markdown(msg["content"])
         if role == "assistant" and msg.get("response_time_ms"):
             st.markdown(
@@ -491,13 +602,13 @@ if user_input:
     with st.chat_message("user", avatar="🧑"):
         st.markdown(user_input)
 
-    # Append user message locallygytf65
+    # Append user message 
     messages = st.session_state.thread_messages.get(current_tid, [])
     messages.append({"role": "user", "content": user_input, "response_time_ms": None})
     st.session_state.thread_messages[current_tid] = messages
 
     # Send to API
-    with st.chat_message("assistant", avatar="🤖"):
+    with st.chat_message("assistant", avatar=assistant_chat_avatar()):
         with st.spinner("Thinking…"):
             try:
                 result = api_send_message(user_input, thread_id=current_tid)
