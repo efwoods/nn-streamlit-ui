@@ -1,0 +1,3 @@
+text needs to be larger
+click on images
+share avatar button
