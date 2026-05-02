@@ -216,6 +216,20 @@ def api_send_message(
     return resp.json()
 
 
+class _BytesAttachment:
+    """Stand-in for Streamlit UploadedFile when resending attachments after st.rerun()."""
+
+    __slots__ = ("name", "type", "_data")
+
+    def __init__(self, name: str, mime: str, data: bytes):
+        self.name = name
+        self.type = mime
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
 def _preview_attachment_bar(uploaded_file) -> None:
     """Inline preview for the composer (image thumbnail or file caption)."""
     if uploaded_file.type and uploaded_file.type.startswith("image/"):
@@ -502,7 +516,10 @@ section[data-testid="stMain"] div[data-testid="stForm"] form div[data-testid="co
 }
 /* Reserve scroll space above the docked composer */
 section[data-testid="stMain"] .block-container {
-    padding-bottom: clamp(9rem, 20vh, 14rem) !important;
+    padding-bottom: clamp(11rem, 28vh, 22rem) !important;
+}
+section[data-testid="stMain"] [data-testid="stChatMessage"] {
+    scroll-margin-bottom: min(24vh, 15rem);
 }
 /*
  * Pin only the inner <form>, not the outer stForm wrapper. Styling the wrapper with
@@ -792,6 +809,95 @@ for msg in messages:
                 unsafe_allow_html=True,
             )
 
+# ── Pending API send (must render above fixed composer — before st.form) ──
+_pending_send = st.session_state.get("_studio_pending_send")
+if _pending_send and _pending_send.get("tid") == tid:
+    _ptid = _pending_send["tid"]
+    _text_p = (_pending_send.get("text") or "").strip()
+    _raw_atts = _pending_send.get("attachments") or []
+    _files_payload = (
+        [
+            _BytesAttachment(a["name"], a["type"], a["bytes"])
+            for a in _raw_atts
+        ]
+        if _raw_atts
+        else None
+    )
+
+    with st.chat_message("assistant", avatar=assistant_chat_avatar()):
+        with st.spinner("Thinking…"):
+            try:
+                result = api_send_message(_text_p, thread_id=_ptid, attachments=_files_payload)
+                reply = result.get("content", "(empty response)")
+                resp_time = result.get("total_response_time_ms")
+                returned_tid = result.get("thread_id")
+
+                st.markdown(reply)
+                if resp_time:
+                    st.markdown(
+                        f'<span class="resp-time">⏱ {resp_time} ms</span>',
+                        unsafe_allow_html=True,
+                    )
+
+                _msgs = st.session_state.thread_messages.get(_ptid, [])
+                _msgs.append({
+                    "role": "assistant",
+                    "content": reply,
+                    "response_time_ms": resp_time,
+                    "metadata": result.get("response_metadata", {}),
+                })
+
+                final_tid = returned_tid or _ptid
+
+                if final_tid:
+                    if _ptid == NEW_THREAD or _ptid is None or _ptid != final_tid:
+                        st.session_state.thread_messages[final_tid] = _msgs
+                        if _ptid in st.session_state.thread_messages and _ptid != final_tid:
+                            del st.session_state.thread_messages[_ptid]
+                        st.session_state.active_thread_id = final_tid
+
+                        if has_api_key and cfg_ok:
+                            try:
+                                st.session_state.backend_threads = fetch_threads(assistant_id)
+                            except Exception:
+                                pass
+
+                    if final_tid not in st.session_state.conversation_titles:
+                        title_src = _text_p if _text_p else (
+                            _raw_atts[0]["name"] if _raw_atts else ""
+                        )
+                        short = title_src[:45] + ("…" if len(title_src) > 45 else "")
+                        st.session_state.conversation_titles[final_tid] = short
+
+                if not st.session_state.active_thread_id:
+                    st.session_state.active_thread_id = final_tid
+
+                if _raw_atts:
+                    st.session_state.attachment_uploader_bump += 1
+
+                st.session_state.pop("_studio_pending_send", None)
+
+            except requests.exceptions.ConnectionError:
+                st.session_state.pop("_studio_pending_send", None)
+                st.error(
+                    f"❌ Could not connect to `{st.session_state.base_url}`. Is the server running?"
+                )
+            except requests.exceptions.HTTPError as exc:
+                st.session_state.pop("_studio_pending_send", None)
+                status = exc.response.status_code if exc.response is not None else "?"
+                detail = ""
+                try:
+                    detail = exc.response.json().get("detail", "")
+                except Exception:
+                    pass
+                st.error(f"❌ HTTP {status}: {detail or str(exc)}")
+            except requests.exceptions.Timeout:
+                st.session_state.pop("_studio_pending_send", None)
+                st.error("❌ Request timed out. The server may be overloaded.")
+            except Exception as exc:
+                st.session_state.pop("_studio_pending_send", None)
+                st.error(f"❌ Unexpected error: {exc}")
+
 # ── Message composer: one row [attach | type message | send] + preview inside form ──
 composer_disabled = bool(errors)
 placeholder = "Type your message…" if not errors else "Fix configuration errors before chatting."
@@ -841,15 +947,11 @@ elif st.session_state.pending_auto_message:
 
 should_send = auto_from_pending or (submitted and (bool(text) or bool(attachment)))
 
-# ── Process message ──
+# ── Process message (enqueue user turn + rerun so API/chat renders above fixed form) ──
 if should_send:
-    # Use the already-resolved tid from above (don't re-assign here)
-    current_tid = tid  # this 'tid' comes from the line before the header
-
-    files_payload = [attachment] if attachment else None
+    current_tid = tid
 
     save_meta = None
-    display_msg: dict = {"content": text, "attachment_meta": None}
     if attachment:
         mime = attachment.type or ""
         save_meta = {
@@ -858,85 +960,30 @@ if should_send:
         }
         if mime.startswith("image/"):
             save_meta["bytes"] = attachment.getvalue()
-        display_msg["attachment_meta"] = save_meta
 
-    # Display user message immediately
-    with st.chat_message("user", avatar="🧑"):
-        _render_user_chat_content(display_msg)
-
-    # Append user message
-    messages = st.session_state.thread_messages.get(current_tid, [])
-    messages.append({
+    _msgs = st.session_state.thread_messages.get(current_tid, [])
+    _msgs.append({
         "role": "user",
         "content": text,
         "response_time_ms": None,
         "attachment_meta": save_meta,
     })
-    st.session_state.thread_messages[current_tid] = messages
+    st.session_state.thread_messages[current_tid] = _msgs
 
-    # Send to API
-    with st.chat_message("assistant", avatar=assistant_chat_avatar()):
-        with st.spinner("Thinking…"):
-            try:
-                result = api_send_message(text, thread_id=current_tid, attachments=files_payload)
-                reply = result.get("content", "(empty response)")
-                resp_time = result.get("total_response_time_ms")
-                returned_tid = result.get("thread_id")
+    _att_payload = None
+    if attachment:
+        _att_payload = [
+            {
+                "name": attachment.name,
+                "type": attachment.type or "application/octet-stream",
+                "bytes": attachment.getvalue(),
+            }
+        ]
 
-                st.markdown(reply)
-                if resp_time:
-                    st.markdown(f'<span class="resp-time">⏱ {resp_time} ms</span>', unsafe_allow_html=True)
+    st.session_state["_studio_pending_send"] = {
+        "tid": current_tid,
+        "text": text,
+        "attachments": _att_payload,
+    }
 
-                # Append assistant reply
-                messages.append({
-                    "role": "assistant",
-                    "content": reply,
-                    "response_time_ms": resp_time,
-                    "metadata": result.get("response_metadata", {}),
-                })
-
-                # === FIXED THREAD PROMOTION ===
-                final_tid = returned_tid or current_tid
-
-                if final_tid:
-                    if current_tid == NEW_THREAD or current_tid is None or current_tid != final_tid:
-                        # Promote / move to real thread
-                        st.session_state.thread_messages[final_tid] = messages
-                        if current_tid in st.session_state.thread_messages and current_tid != final_tid:
-                            del st.session_state.thread_messages[current_tid]
-                        st.session_state.active_thread_id = final_tid
-
-                        # Refresh sidebar
-                        if has_api_key and cfg_ok:
-                            try:
-                                st.session_state.backend_threads = fetch_threads(assistant_id)
-                            except Exception:
-                                pass
-
-                    # Default title
-                    if final_tid not in st.session_state.conversation_titles:
-                        title_src = text if text else (attachment.name if attachment else "")
-                        short = title_src[:45] + ("…" if len(title_src) > 45 else "")
-                        st.session_state.conversation_titles[final_tid] = short
-
-                # Safety
-                if not st.session_state.active_thread_id:
-                    st.session_state.active_thread_id = final_tid
-
-                if attachment:
-                    st.session_state.attachment_uploader_bump += 1
-
-            except requests.exceptions.ConnectionError:
-                st.error(f"❌ Could not connect to `{st.session_state.base_url}`. Is the server running?")
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else "?"
-                detail = ""
-                try:
-                    detail = exc.response.json().get("detail", "")
-                except Exception:
-                    pass
-                st.error(f"❌ HTTP {status}: {detail or str(exc)}")
-            except requests.exceptions.Timeout:
-                st.error("❌ Request timed out. The server may be overloaded.")
-            except Exception as exc:
-                st.error(f"❌ Unexpected error: {exc}")
+    st.rerun()
