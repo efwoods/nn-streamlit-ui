@@ -8,9 +8,12 @@ Run with:
 import base64
 import json
 import io
+import uuid
 import requests
 from datetime import datetime
+from urllib.parse import urlencode, urlparse, urlunparse
 import streamlit as st
+import streamlit.components.v1 as components
 import os
 from dotenv import load_dotenv
 
@@ -34,8 +37,9 @@ st.set_page_config(
 )
 
 # ──────────────────────────────────────────────
-# Assistant ID — read from URL query param
-#   Usage:  http://localhost:8501/?assistant_id=abc123
+# URL query params: assistant_id, optional api_key, optional thread_id
+#   Example:  http://localhost:8501/?assistant_id=abc&thread_id=…
+#   Use "Share conversation" in the sidebar to copy the current link.
 # ──────────────────────────────────────────────
 assistant_id: str = st.query_params.get("assistant_id", "").strip()
 api_key: str= st.query_params.get("api_key", "").strip()
@@ -347,6 +351,48 @@ def _toggle_settings() -> None:
     st.session_state.show_settings = not st.session_state.show_settings
 
 
+def _app_public_base_url() -> str:
+    """Browser-facing origin + path (no query string) for share links."""
+    ctx_url = getattr(st.context, "url", None)
+    if ctx_url:
+        p = urlparse(str(ctx_url))
+        path = p.path or "/"
+        return urlunparse((p.scheme, p.netloc, path, "", "", ""))
+    h = st.context.headers
+    host = h.get("Host") or h.get("host") or "localhost:8501"
+    scheme = h.get("X-Forwarded-Proto") or h.get("x-forwarded-proto") or "http"
+    return f"{scheme}://{host}/"
+
+
+def _sync_thread_id_query_param(tid: str | None) -> None:
+    """Reflect the open conversation in the URL so links are shareable."""
+    qp = st.query_params
+    want: str | None = None if (tid is None or tid == NEW_THREAD) else tid
+    cur = (qp.get("thread_id") or "").strip() or None
+    if want == cur:
+        return
+    if want:
+        qp["thread_id"] = want
+    elif "thread_id" in qp:
+        del qp["thread_id"]
+
+
+def build_share_url() -> str:
+    """Full URL with assistant, optional API key, and thread (if any)."""
+    parts: dict[str, str] = {}
+    if assistant_id:
+        parts["assistant_id"] = assistant_id
+    ak = (st.session_state.api_key or "").strip()
+    if ak:
+        parts["api_key"] = ak
+    tid = st.session_state.active_thread_id
+    if tid and tid != NEW_THREAD:
+        parts["thread_id"] = tid
+    q = urlencode(parts)
+    base = _app_public_base_url().rstrip("/")
+    return f"{base}/?{q}" if q else f"{base}/"
+
+
 # ──────────────────────────────────────────────
 # Startup / initialization logic
 # (runs every Streamlit render pass)
@@ -390,12 +436,18 @@ if has_api_key and cfg_ok:
             st.session_state.threads_loaded = True
             st.session_state.last_loaded_api_key = st.session_state.api_key
 
-            # Smart restore of active thread
-            if st.session_state.active_thread_id and st.session_state.active_thread_id != NEW_THREAD:
-                if not any(t["thread_id"] == st.session_state.active_thread_id for t in threads):
+            # Smart restore of active thread (`thread_id` query opens a shared conversation)
+            qp_tid = (st.query_params.get("thread_id") or "").strip()
+            thread_ids = {t["thread_id"] for t in threads}
+            if qp_tid and qp_tid in thread_ids:
+                st.session_state.active_thread_id = qp_tid
+            elif st.session_state.active_thread_id and st.session_state.active_thread_id != NEW_THREAD:
+                if st.session_state.active_thread_id not in thread_ids:
                     if threads:
                         st.session_state.active_thread_id = threads[0]["thread_id"]
-            elif threads and (st.session_state.active_thread_id is None or st.session_state.active_thread_id == NEW_THREAD):
+            elif threads and (
+                st.session_state.active_thread_id is None or st.session_state.active_thread_id == NEW_THREAD
+            ):
                 st.session_state.active_thread_id = threads[0]["thread_id"]
         except Exception as exc:
             st.error(f"❌ Failed to load conversations: {exc}")
@@ -420,6 +472,8 @@ elif not has_api_key and cfg_ok and st.session_state.active_thread_id is None:
     st.session_state.active_thread_id = NEW_THREAD
     st.session_state.thread_messages[NEW_THREAD] = []
     st.session_state.pending_auto_message = AUTO_GREETING
+
+_sync_thread_id_query_param(st.session_state.active_thread_id)
 
 # ──────────────────────────────────────────────
 # Custom CSS
@@ -658,6 +712,40 @@ with st.sidebar:
         st.session_state.thread_messages[NEW_THREAD] = []
         st.session_state.pending_auto_message = AUTO_GREETING
         st.rerun()
+
+    if cfg_ok and assistant_id:
+        share_url = build_share_url()
+        share_btn_id = f"studio-share-{uuid.uuid4().hex[:10]}"
+        url_literal = json.dumps(share_url)
+        components.html(
+            f"""
+<div style="font-family: 'Source Sans Pro', sans-serif; margin-top: 6px;">
+  <button type="button" id="{share_btn_id}"
+    style="width:100%; padding:6px 10px; border-radius:8px; cursor:pointer; font-size:0.85rem;
+           margin-bottom:2px; text-align:center;">
+    🔗 Share conversation
+  </button>
+</div>
+<script>
+(function () {{
+  var btn = document.getElementById({json.dumps(share_btn_id)});
+  if (!btn) return;
+  var url = {url_literal};
+  btn.addEventListener("click", function () {{
+    navigator.clipboard.writeText(url).then(function () {{
+      btn.textContent = "✓ Copied";
+      setTimeout(function () {{ btn.textContent = "🔗 Share conversation"; }}, 2000);
+    }}).catch(function () {{
+      btn.textContent = "Copy blocked — use browser bar";
+      setTimeout(function () {{ btn.textContent = "🔗 Share conversation"; }}, 2500);
+    }});
+  }});
+}})();
+</script>
+            """,
+            height=52,
+        )
+        st.caption("Copies a link to this assistant and open chat (includes API key if set).")
 
     st.markdown("---")
 
