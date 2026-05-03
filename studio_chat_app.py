@@ -8,6 +8,7 @@ Run with:
 import base64
 import json
 import io
+import time
 import uuid
 import requests
 from datetime import datetime
@@ -170,12 +171,79 @@ def upload_avatar_reference_image_url(image_url: str) -> None:
     resp.raise_for_status()
 
 
+def _parse_message_sse_body(body: str) -> dict:
+    """Turn POST /message SSE (data: … lines) into the JSON shape the UI expects."""
+    streamed_parts: list[str] = []
+    merged: dict = {}
+    for raw_line in (body or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].lstrip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "assistant_token":
+            t = obj.get("text")
+            if t is not None:
+                streamed_parts.append(str(t))
+        for k in ("content", "thread_id", "total_response_time_ms", "response_metadata"):
+            if k in obj and obj[k] is not None:
+                merged[k] = obj[k]
+    text = "".join(streamed_parts)
+    if text and not merged.get("content"):
+        merged["content"] = text
+    merged.setdefault("content", "")
+    return merged
+
+
+def _coerce_message_response_dict(resp: requests.Response) -> dict:
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    if "event-stream" in ct:
+        out = _parse_message_sse_body(resp.text or "")
+        # #region agent log
+        try:
+            with open("/home/user/gh/anubis/frontend/.cursor/debug-0d481b.log", "a") as _df:
+                _df.write(
+                    json.dumps(
+                        {
+                            "sessionId": "0d481b",
+                            "runId": "post-fix",
+                            "timestamp": int(time.time() * 1000),
+                            "hypothesisId": "verify",
+                            "location": "studio_chat_app.py:_coerce_message_response_dict",
+                            "message": "SSE parsed for /message",
+                            "data": {
+                                "content_len": len(out.get("content") or ""),
+                                "has_thread_id": out.get("thread_id") is not None,
+                                "has_response_time": out.get("total_response_time_ms") is not None,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
+        return out
+    return resp.json()
+
+
 def api_send_message(
     user_message: str,
     thread_id: str | None = None,
     attachments: list | None = None,
 ) -> dict:
     """POST /message/{assistant_id}  →  {content, thread_id, total_response_time_ms, …}
+
+    Sends ``stream=false`` so the API returns JSON (default server form is ``stream=True``
+    / SSE). If the response is still ``text/event-stream``, it is parsed in
+    ``_coerce_message_response_dict``.
 
     With attachments, sends multipart/form-data (same ``files`` field pattern as
     ``update_avatar_identity_with_media``).
@@ -188,6 +256,8 @@ def api_send_message(
         "your_description": st.session_state.user_description or None,
         "conversation_title": title,
         "thread_id": real_thread_id,
+        # Server default is stream=True (SSE); this UI expects a JSON body.
+        "stream": False,
     }
     url = f"{_base()}/message/{assistant_id}"
     if attachments:
@@ -217,7 +287,33 @@ def api_send_message(
             timeout=None,
         )
     resp.raise_for_status()
-    return resp.json()
+    # #region agent log
+    try:
+        _bl = len(resp.content or b"")
+        _pv = (resp.text or "")[:400].replace("\n", "\\n")
+        with open("/home/user/gh/anubis/frontend/.cursor/debug-0d481b.log", "a") as _df:
+            _df.write(
+                json.dumps(
+                    {
+                        "sessionId": "0d481b",
+                        "timestamp": int(time.time() * 1000),
+                        "hypothesisId": "H1-H3",
+                        "location": "studio_chat_app.py:api_send_message",
+                        "message": "POST /message response before resp.json()",
+                        "data": {
+                            "status": resp.status_code,
+                            "content_type": resp.headers.get("Content-Type", ""),
+                            "content_len": _bl,
+                            "body_preview": _pv,
+                        },
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    # #endregion
+    return _coerce_message_response_dict(resp)
 
 
 class _BytesAttachment:
@@ -983,6 +1079,28 @@ if _pending_send and _pending_send.get("tid") == tid:
                 st.session_state.pop("_studio_pending_send", None)
                 st.error("❌ Request timed out. The server may be overloaded.")
             except Exception as exc:
+                # #region agent log
+                try:
+                    with open("/home/user/gh/anubis/frontend/.cursor/debug-0d481b.log", "a") as _df:
+                        _df.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "0d481b",
+                                    "timestamp": int(time.time() * 1000),
+                                    "hypothesisId": "H4-H5",
+                                    "location": "studio_chat_app.py:pending_send",
+                                    "message": "unexpected exception in send flow",
+                                    "data": {
+                                        "exc_type": type(exc).__name__,
+                                        "exc_repr": repr(exc)[:500],
+                                    },
+                                }
+                            )
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+                # #endregion
                 st.session_state.pop("_studio_pending_send", None)
                 st.error(f"❌ Unexpected error: {exc}")
 
