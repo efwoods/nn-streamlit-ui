@@ -1,3 +1,6 @@
 # Upload limit for st.file_uploader (megabytes). Default Streamlit is 200.
 [server]
 maxUploadSize = 25
+# Polling avoids inotify "watch limit reached" (ENOSPC) when the kernel cap is
+# exhausted—common with a large .venv plus IDE/other watchers on the tree.
+fileWatcherType = "poll"

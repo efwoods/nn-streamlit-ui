@@ -1,7 +1,8 @@
 """
 Studio Assistant Chat UI
 -------------------------
-A Streamlit chat interface for the /studio/{assistant_id} API endpoint.
+A Streamlit chat interface for ``POST /message/{assistant_id}`` with **SSE**
+streaming (``stream=true``): assistant tokens are shown as they arrive.
 Run with:
     streamlit run studio_chat_app.py
 """
@@ -16,7 +17,9 @@ from urllib.parse import urlencode, urlparse, urlunparse
 import streamlit as st
 import streamlit.components.v1 as components
 import os
+from collections.abc import Callable
 from dotenv import load_dotenv
+from PIL import Image, ImageOps
 
 load_dotenv()
 
@@ -134,10 +137,13 @@ def fetch_avatar_reference_icon() -> str | None:
 
 def upload_avatar_reference_image(uploaded_file) -> None:
     """POST /update_avatar_identity_with_media with reference_image=true."""
+    mime = uploaded_file.type or "image/jpeg"
+    body, ct = _chat_image_bytes_and_mime(uploaded_file.getvalue(), mime)
+    ct_use = ct if ct.startswith("image/") else mime
     files = [
         (
             "files",
-            (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type or "image/jpeg"),
+            (uploaded_file.name, body, ct_use),
         )
     ]
     data = {
@@ -171,6 +177,28 @@ def upload_avatar_reference_image_url(image_url: str) -> None:
     resp.raise_for_status()
 
 
+def _accumulate_sse_message_obj(obj: dict, streamed_parts: list[str], merged: dict) -> bool:
+    """Merge one SSE JSON object into streamed_parts / merged. Returns True if a token was appended."""
+    hit = False
+    if obj.get("type") == "assistant_token":
+        t = obj.get("text")
+        if t is not None:
+            streamed_parts.append(str(t))
+            hit = True
+    for k in ("content", "thread_id", "total_response_time_ms", "response_metadata"):
+        if k in obj and obj[k] is not None:
+            merged[k] = obj[k]
+    return hit
+
+
+def _finalize_merged_message(streamed_parts: list[str], merged: dict) -> dict:
+    text = "".join(streamed_parts)
+    if text and not merged.get("content"):
+        merged["content"] = text
+    merged.setdefault("content", "")
+    return merged
+
+
 def _parse_message_sse_body(body: str) -> dict:
     """Turn POST /message SSE (data: … lines) into the JSON shape the UI expects."""
     streamed_parts: list[str] = []
@@ -188,62 +216,52 @@ def _parse_message_sse_body(body: str) -> dict:
             continue
         if not isinstance(obj, dict):
             continue
-        if obj.get("type") == "assistant_token":
-            t = obj.get("text")
-            if t is not None:
-                streamed_parts.append(str(t))
-        for k in ("content", "thread_id", "total_response_time_ms", "response_metadata"):
-            if k in obj and obj[k] is not None:
-                merged[k] = obj[k]
-    text = "".join(streamed_parts)
-    if text and not merged.get("content"):
-        merged["content"] = text
-    merged.setdefault("content", "")
-    return merged
+        _accumulate_sse_message_obj(obj, streamed_parts, merged)
+    return _finalize_merged_message(streamed_parts, merged)
 
 
-def _coerce_message_response_dict(resp: requests.Response) -> dict:
-    ct = (resp.headers.get("Content-Type") or "").lower()
-    if "event-stream" in ct:
-        out = _parse_message_sse_body(resp.text or "")
-        # #region agent log
+def consume_streaming_message_response(
+    resp: requests.Response,
+    on_partial_text: Callable[[str], None] | None = None,
+) -> dict:
+    """Read a POST /message SSE body incrementally; optional callback after each assistant_token.
+
+    Does not close ``resp``; the caller must close the response (e.g. in a ``finally`` block).
+    """
+    streamed_parts: list[str] = []
+    merged: dict = {}
+    for raw_line in resp.iter_lines(decode_unicode=True):
+        if raw_line is None:
+            continue
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].lstrip()
+        if not payload or payload == "[DONE]":
+            continue
         try:
-            with open("/home/user/gh/anubis/frontend/.cursor/debug-0d481b.log", "a") as _df:
-                _df.write(
-                    json.dumps(
-                        {
-                            "sessionId": "0d481b",
-                            "runId": "post-fix",
-                            "timestamp": int(time.time() * 1000),
-                            "hypothesisId": "verify",
-                            "location": "studio_chat_app.py:_coerce_message_response_dict",
-                            "message": "SSE parsed for /message",
-                            "data": {
-                                "content_len": len(out.get("content") or ""),
-                                "has_thread_id": out.get("thread_id") is not None,
-                                "has_response_time": out.get("total_response_time_ms") is not None,
-                            },
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        # #endregion
-        return out
-    return resp.json()
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        had_token = _accumulate_sse_message_obj(obj, streamed_parts, merged)
+        if had_token and on_partial_text is not None:
+            on_partial_text("".join(streamed_parts))
+    return _finalize_merged_message(streamed_parts, merged)
 
 
 def api_send_message(
     user_message: str,
     thread_id: str | None = None,
     attachments: list | None = None,
+    on_stream_chunk: Callable[[str], None] | None = None,
 ) -> dict:
-    """POST /message/{assistant_id}  →  {content, thread_id, total_response_time_ms, …}
+    """POST /message/{assistant_id} with ``stream=true`` (SSE) by default.
 
-    Sends ``stream=false`` so the API returns JSON (default server form is ``stream=True``
-    / SSE). If the response is still ``text/event-stream``, it is parsed in
-    ``_coerce_message_response_dict``.
+    Uses HTTP streaming so tokens can be shown as they arrive via ``on_stream_chunk``.
+    Returns the same merged dict shape as before: ``content``, ``thread_id``,
+    ``total_response_time_ms``, ``response_metadata``.
 
     With attachments, sends multipart/form-data (same ``files`` field pattern as
     ``update_avatar_identity_with_media``).
@@ -256,8 +274,7 @@ def api_send_message(
         "your_description": st.session_state.user_description or None,
         "conversation_title": title,
         "thread_id": real_thread_id,
-        # Server default is stream=True (SSE); this UI expects a JSON body.
-        "stream": False,
+        "stream": True,
     }
     url = f"{_base()}/message/{assistant_id}"
     if attachments:
@@ -277,6 +294,7 @@ def api_send_message(
             headers=_headers(),
             data={k: v for k, v in payload.items() if v is not None},
             files=files,
+            stream=True,
             timeout=None,
         )
     else:
@@ -284,13 +302,13 @@ def api_send_message(
             url,
             headers=_headers(),
             data=payload,
+            stream=True,
             timeout=None,
         )
     resp.raise_for_status()
+    ct = (resp.headers.get("Content-Type") or "").lower()
     # #region agent log
     try:
-        _bl = len(resp.content or b"")
-        _pv = (resp.text or "")[:400].replace("\n", "\\n")
         with open("/home/user/gh/anubis/frontend/.cursor/debug-0d481b.log", "a") as _df:
             _df.write(
                 json.dumps(
@@ -299,12 +317,11 @@ def api_send_message(
                         "timestamp": int(time.time() * 1000),
                         "hypothesisId": "H1-H3",
                         "location": "studio_chat_app.py:api_send_message",
-                        "message": "POST /message response before resp.json()",
+                        "message": "POST /message streaming response",
                         "data": {
                             "status": resp.status_code,
                             "content_type": resp.headers.get("Content-Type", ""),
-                            "content_len": _bl,
-                            "body_preview": _pv,
+                            "sse": "event-stream" in ct,
                         },
                     }
                 )
@@ -313,7 +330,14 @@ def api_send_message(
     except Exception:
         pass
     # #endregion
-    return _coerce_message_response_dict(resp)
+    try:
+        if "event-stream" in ct:
+            return consume_streaming_message_response(resp, on_stream_chunk)
+        if "application/json" in ct:
+            return resp.json()
+        return _parse_message_sse_body(resp.text or "")
+    finally:
+        resp.close()
 
 
 class _BytesAttachment:
@@ -333,7 +357,9 @@ class _BytesAttachment:
 def _preview_attachment_bar(uploaded_file) -> None:
     """Inline preview for the composer (image thumbnail or file caption)."""
     if uploaded_file.type and uploaded_file.type.startswith("image/"):
-        st.image(io.BytesIO(uploaded_file.getvalue()), width=min(220, 320))
+        raw = uploaded_file.getvalue()
+        pil = _pil_image_exif_normalized(raw)
+        st.image(pil if pil is not None else io.BytesIO(raw), width=min(220, 320))
     else:
         size_kb = len(uploaded_file.getbuffer()) / 1024.0
         st.caption(f"📎 **{uploaded_file.name}** — {size_kb:.1f} KB")
@@ -347,7 +373,9 @@ def _render_user_chat_content(msg: dict) -> None:
         mime = att.get("mime") or ""
         name = att.get("name", "attachment")
         if mime.startswith("image/") and att.get("bytes"):
-            st.image(io.BytesIO(att["bytes"]), width=min(280, 360))
+            b = att["bytes"]
+            pil = _pil_image_exif_normalized(b)
+            st.image(pil if pil is not None else io.BytesIO(b), width=min(280, 360))
         elif mime.startswith("image/"):
             st.caption(f"🖼️ {name}")
         else:
@@ -360,6 +388,41 @@ def _render_user_chat_content(msg: dict) -> None:
 # ──────────────────────────────────────────────
 # Conversion / display helpers
 # ──────────────────────────────────────────────
+
+def _pil_image_exif_normalized(data: bytes) -> Image.Image | None:
+    """Decode image bytes and apply EXIF Orientation so pixels match the camera preview."""
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+        return ImageOps.exif_transpose(img)
+    except Exception:
+        return None
+
+
+def _chat_image_bytes_and_mime(data: bytes, mime: str | None) -> tuple[bytes, str]:
+    """
+    Re-encode image with EXIF orientation baked into pixels.
+
+    Many viewers (and model APIs) ignore EXIF; camera JPEGs then look rotated.
+    """
+    img = _pil_image_exif_normalized(data)
+    if img is None:
+        return data, (mime or "application/octet-stream")
+    mime_l = (mime or "").lower()
+    fmt = (img.format or "").upper()
+    buf = io.BytesIO()
+    try:
+        if fmt == "JPEG" or "jpeg" in mime_l or "jpg" in mime_l:
+            img.convert("RGB").save(buf, format="JPEG", quality=92, optimize=True)
+            return buf.getvalue(), "image/jpeg"
+        if fmt == "WEBP" or "webp" in mime_l:
+            img.save(buf, format="WEBP", quality=90)
+            return buf.getvalue(), "image/webp"
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue(), "image/png"
+    except Exception:
+        return data, (mime or "application/octet-stream")
+
 
 def _json_export_sanitize(obj):
     """Deep-copy structures for JSON export; encode binary blobs as base64 text."""
@@ -1009,100 +1072,110 @@ if _pending_send and _pending_send.get("tid") == tid:
     )
 
     with st.chat_message("assistant", avatar=assistant_chat_avatar()):
-        with st.spinner("Thinking…"):
-            try:
-                result = api_send_message(_text_p, thread_id=_ptid, attachments=_files_payload)
-                reply = result.get("content", "(empty response)")
-                resp_time = result.get("total_response_time_ms")
-                returned_tid = result.get("thread_id")
+        stream_slot = st.empty()
+        stream_slot.caption("Thinking…")
+        try:
+            def _show_chunk(text_so_far: str) -> None:
+                stream_slot.markdown(text_so_far)
 
-                st.markdown(reply)
-                if resp_time:
-                    st.markdown(
-                        f'<span class="resp-time">⏱ {resp_time} ms</span>',
-                        unsafe_allow_html=True,
-                    )
+            result = api_send_message(
+                _text_p,
+                thread_id=_ptid,
+                attachments=_files_payload,
+                on_stream_chunk=_show_chunk,
+            )
+            reply = result.get("content", "(empty response)")
+            # Final render (covers responses with only a terminal ``content`` field, no tokens)
+            stream_slot.markdown(reply)
+            resp_time = result.get("total_response_time_ms")
+            returned_tid = result.get("thread_id")
 
-                _msgs = st.session_state.thread_messages.get(_ptid, [])
-                _msgs.append({
-                    "role": "assistant",
-                    "content": reply,
-                    "response_time_ms": resp_time,
-                    "metadata": result.get("response_metadata", {}),
-                })
+            if resp_time:
+                st.markdown(
+                    f'<span class="resp-time">⏱ {resp_time} ms</span>',
+                    unsafe_allow_html=True,
+                )
 
-                final_tid = returned_tid or _ptid
+            _msgs = st.session_state.thread_messages.get(_ptid, [])
+            _msgs.append({
+                "role": "assistant",
+                "content": reply,
+                "response_time_ms": resp_time,
+                "metadata": result.get("response_metadata", {}),
+            })
 
-                if final_tid:
-                    if _ptid == NEW_THREAD or _ptid is None or _ptid != final_tid:
-                        st.session_state.thread_messages[final_tid] = _msgs
-                        if _ptid in st.session_state.thread_messages and _ptid != final_tid:
-                            del st.session_state.thread_messages[_ptid]
-                        st.session_state.active_thread_id = final_tid
+            final_tid = returned_tid or _ptid
 
-                        if has_api_key and cfg_ok:
-                            try:
-                                st.session_state.backend_threads = fetch_threads(assistant_id)
-                            except Exception:
-                                pass
-
-                    if final_tid not in st.session_state.conversation_titles:
-                        title_src = _text_p if _text_p else (
-                            _raw_atts[0]["name"] if _raw_atts else ""
-                        )
-                        short = title_src[:45] + ("…" if len(title_src) > 45 else "")
-                        st.session_state.conversation_titles[final_tid] = short
-
-                if not st.session_state.active_thread_id:
+            if final_tid:
+                if _ptid == NEW_THREAD or _ptid is None or _ptid != final_tid:
+                    st.session_state.thread_messages[final_tid] = _msgs
+                    if _ptid in st.session_state.thread_messages and _ptid != final_tid:
+                        del st.session_state.thread_messages[_ptid]
                     st.session_state.active_thread_id = final_tid
 
-                if _raw_atts:
-                    st.session_state.attachment_uploader_bump += 1
+                    if has_api_key and cfg_ok:
+                        try:
+                            st.session_state.backend_threads = fetch_threads(assistant_id)
+                        except Exception:
+                            pass
 
-                st.session_state.pop("_studio_pending_send", None)
+                if final_tid not in st.session_state.conversation_titles:
+                    title_src = _text_p if _text_p else (
+                        _raw_atts[0]["name"] if _raw_atts else ""
+                    )
+                    short = title_src[:45] + ("…" if len(title_src) > 45 else "")
+                    st.session_state.conversation_titles[final_tid] = short
 
-            except requests.exceptions.ConnectionError:
-                st.session_state.pop("_studio_pending_send", None)
-                st.error(
-                    f"❌ Could not connect to `{st.session_state.base_url}`. Is the server running?"
-                )
-            except requests.exceptions.HTTPError as exc:
-                st.session_state.pop("_studio_pending_send", None)
-                status = exc.response.status_code if exc.response is not None else "?"
-                detail = ""
-                try:
-                    detail = exc.response.json().get("detail", "")
-                except Exception:
-                    pass
-                st.error(f"❌ HTTP {status}: {detail or str(exc)}")
-            except requests.exceptions.Timeout:
-                st.session_state.pop("_studio_pending_send", None)
-                st.error("❌ Request timed out. The server may be overloaded.")
-            except Exception as exc:
-                # #region agent log
-                try:
-                    with open("/home/user/gh/anubis/frontend/.cursor/debug-0d481b.log", "a") as _df:
-                        _df.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "0d481b",
-                                    "timestamp": int(time.time() * 1000),
-                                    "hypothesisId": "H4-H5",
-                                    "location": "studio_chat_app.py:pending_send",
-                                    "message": "unexpected exception in send flow",
-                                    "data": {
-                                        "exc_type": type(exc).__name__,
-                                        "exc_repr": repr(exc)[:500],
-                                    },
-                                }
-                            )
-                            + "\n"
+            if not st.session_state.active_thread_id:
+                st.session_state.active_thread_id = final_tid
+
+            if _raw_atts:
+                st.session_state.attachment_uploader_bump += 1
+
+            st.session_state.pop("_studio_pending_send", None)
+
+        except requests.exceptions.ConnectionError:
+            st.session_state.pop("_studio_pending_send", None)
+            st.error(
+                f"❌ Could not connect to `{st.session_state.base_url}`. Is the server running?"
+            )
+        except requests.exceptions.HTTPError as exc:
+            st.session_state.pop("_studio_pending_send", None)
+            status = exc.response.status_code if exc.response is not None else "?"
+            detail = ""
+            try:
+                detail = exc.response.json().get("detail", "")
+            except Exception:
+                pass
+            st.error(f"❌ HTTP {status}: {detail or str(exc)}")
+        except requests.exceptions.Timeout:
+            st.session_state.pop("_studio_pending_send", None)
+            st.error("❌ Request timed out. The server may be overloaded.")
+        except Exception as exc:
+            # #region agent log
+            try:
+                with open("/home/user/gh/anubis/frontend/.cursor/debug-0d481b.log", "a") as _df:
+                    _df.write(
+                        json.dumps(
+                            {
+                                "sessionId": "0d481b",
+                                "timestamp": int(time.time() * 1000),
+                                "hypothesisId": "H4-H5",
+                                "location": "studio_chat_app.py:pending_send",
+                                "message": "unexpected exception in send flow",
+                                "data": {
+                                    "exc_type": type(exc).__name__,
+                                    "exc_repr": repr(exc)[:500],
+                                },
+                            }
                         )
-                except Exception:
-                    pass
-                # #endregion
-                st.session_state.pop("_studio_pending_send", None)
-                st.error(f"❌ Unexpected error: {exc}")
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # #endregion
+            st.session_state.pop("_studio_pending_send", None)
+            st.error(f"❌ Unexpected error: {exc}")
 
 # ── Message composer: one row [attach | type message | send] + preview inside form ──
 composer_disabled = bool(errors)
@@ -1157,6 +1230,12 @@ should_send = auto_from_pending or (submitted and (bool(text) or bool(attachment
 if should_send:
     current_tid = tid
 
+    img_norm: tuple[bytes, str] | None = None
+    if attachment and (attachment.type or "").startswith("image/"):
+        img_norm = _chat_image_bytes_and_mime(
+            attachment.getvalue(), attachment.type or ""
+        )
+
     save_meta = None
     if attachment:
         mime = attachment.type or ""
@@ -1164,8 +1243,8 @@ if should_send:
             "name": attachment.name,
             "mime": mime,
         }
-        if mime.startswith("image/"):
-            save_meta["bytes"] = attachment.getvalue()
+        if img_norm is not None:
+            save_meta["bytes"], save_meta["mime"] = img_norm
 
     _msgs = st.session_state.thread_messages.get(current_tid, [])
     _msgs.append({
@@ -1178,11 +1257,15 @@ if should_send:
 
     _att_payload = None
     if attachment:
+        att_mime = attachment.type or "application/octet-stream"
+        att_body = attachment.getvalue()
+        if img_norm is not None:
+            att_body, att_mime = img_norm
         _att_payload = [
             {
                 "name": attachment.name,
-                "type": attachment.type or "application/octet-stream",
-                "bytes": attachment.getvalue(),
+                "type": att_mime,
+                "bytes": att_body,
             }
         ]
 
