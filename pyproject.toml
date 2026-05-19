@@ -1,0 +1,15 @@
+[project]
+name = "nn-streamlit-ui"
+version = "0.1.0"
+description = "Streamlit UI for Neural Nexus"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.35.0",
+    "requests>=2.31.0",
+    "python-dotenv",
+    "pillow>=10.0.0",
+]
+
+[tool.uv]
+package = false
