@@ -134,7 +134,7 @@ def fetch_avatar_reference_icon() -> str | None:
         headers["api-key"] = ak
     resp = requests.get(
         f"{_base()}/avatar_reference_image",
-        headers=headers,
+        headers=_headers(),
         params={"assistant_id": assistant_id},
         timeout=15,
     )
@@ -569,8 +569,7 @@ cfg_ok = bool(st.session_state.base_url.strip() and assistant_id)
 
 # ── 0. Reference portrait for assistant avatar (works for anonymous chat too) ──
 if cfg_ok:
-    # Version suffix: bump when fetch semantics change (e.g. anonymous reference image).
-    _rk = f"{assistant_id}:{(st.session_state.api_key or '').strip()}:refimg-v2"
+    _rk = f"{assistant_id}:{st.session_state.api_key}"
     if st.session_state.get("_ref_icon_cache_key") != _rk:
         try:
             st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
