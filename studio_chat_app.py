@@ -123,10 +123,18 @@ def fetch_thread_messages(thread_id: str, assistant_id: str) -> list:
     return resp.json().get("messages", [])
 
 def fetch_avatar_reference_icon() -> str | None:
-    """GET /avatar_reference_image — returns data:image…;base64,… or an https URL string."""
+    """GET /avatar_reference_image — returns data:image…;base64,… or an https URL string.
+
+    This endpoint is public per ``assistant_id``; do not send an empty ``api-key`` header
+    or anonymous callers may get rejected. Include ``api-key`` only when configured.
+    """
+    headers: dict[str, str] = {}
+    ak = (st.session_state.api_key or "").strip()
+    if ak:
+        headers["api-key"] = ak
     resp = requests.get(
         f"{_base()}/avatar_reference_image",
-        headers=_headers(),
+        headers=headers,
         params={"assistant_id": assistant_id},
         timeout=15,
     )
@@ -561,7 +569,8 @@ cfg_ok = bool(st.session_state.base_url.strip() and assistant_id)
 
 # ── 0. Reference portrait for assistant avatar (works for anonymous chat too) ──
 if cfg_ok:
-    _rk = f"{assistant_id}:{st.session_state.api_key}"
+    # Version suffix: bump when fetch semantics change (e.g. anonymous reference image).
+    _rk = f"{assistant_id}:{(st.session_state.api_key or '').strip()}:refimg-v2"
     if st.session_state.get("_ref_icon_cache_key") != _rk:
         try:
             st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
@@ -857,7 +866,10 @@ with st.sidebar:
                     st.error(f"URL upload failed: {exc}")
         elif cfg_ok and not settings_has_api_key:
             st.markdown("---")
-            st.caption("🖼️ **Avatar reference** requires an API key — add one above.")
+            st.caption(
+                "🖼️ The assistant’s reference portrait loads in chat when one is configured "
+                "for this assistant. **Changing** it (upload or URL) needs an API key above."
+            )
 
         if st.button("✅ Save & Close", key="save_settings"):
             st.session_state.show_settings = False
