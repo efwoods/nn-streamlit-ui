@@ -43,7 +43,7 @@ st.set_page_config(
 # ──────────────────────────────────────────────
 # URL query params: assistant_id, optional api_key, optional thread_id
 #   Example:  http://localhost:8501/?assistant_id=abc&thread_id=…
-#   Use "Share conversation" in the sidebar to copy the current link.
+#   Use "Share Avatar" in the sidebar to copy the current link.
 # ──────────────────────────────────────────────
 assistant_id: str = st.query_params.get("assistant_id", "").strip()
 api_key: str= st.query_params.get("api_key", "").strip()
@@ -545,16 +545,15 @@ def _sync_thread_id_query_param(tid: str | None) -> None:
 
 
 def build_share_url() -> str:
-    """Full URL with assistant, optional API key, and thread (if any)."""
+    """Public link to this assistant only — never includes the API key or thread_id.
+
+    The api_key is a secret and must not be leaked in a shared URL; the thread_id is
+    omitted so the link opens a fresh chat with the assistant rather than a private
+    conversation.
+    """
     parts: dict[str, str] = {}
     if assistant_id:
         parts["assistant_id"] = assistant_id
-    ak = (st.session_state.api_key or "").strip()
-    if ak:
-        parts["api_key"] = ak
-    tid = st.session_state.active_thread_id
-    if tid and tid != NEW_THREAD:
-        parts["thread_id"] = tid
     q = urlencode(parts)
     base = _app_public_base_url().rstrip("/")
     return f"{base}/?{q}" if q else f"{base}/"
@@ -893,7 +892,7 @@ with st.sidebar:
   <button type="button" id="{share_btn_id}"
     style="width:100%; padding:6px 10px; border-radius:8px; cursor:pointer; font-size:0.85rem;
            margin-bottom:2px; text-align:center;">
-    🔗 Share conversation
+    🔗 Share Avatar
   </button>
 </div>
 <script>
@@ -904,10 +903,10 @@ with st.sidebar:
   btn.addEventListener("click", function () {{
     navigator.clipboard.writeText(url).then(function () {{
       btn.textContent = "✓ Copied";
-      setTimeout(function () {{ btn.textContent = "🔗 Share conversation"; }}, 2000);
+      setTimeout(function () {{ btn.textContent = "🔗 Share Avatar"; }}, 2000);
     }}).catch(function () {{
       btn.textContent = "Copy blocked — use browser bar";
-      setTimeout(function () {{ btn.textContent = "🔗 Share conversation"; }}, 2500);
+      setTimeout(function () {{ btn.textContent = "🔗 Share Avatar"; }}, 2500);
     }});
   }});
 }})();
@@ -915,7 +914,7 @@ with st.sidebar:
             """,
             height=52,
         )
-        st.caption("Copies a link to this assistant and open chat (includes API key if set).")
+        st.caption("Copies a link to this assistant (no API key, opens a fresh chat).")
 
     st.markdown("---")
 
