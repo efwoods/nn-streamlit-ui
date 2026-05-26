@@ -1,3 +1,10 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx",
+#     "python-dotenv",
+# ]
+# ///
 import subprocess
 import httpx
 import os
