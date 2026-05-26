@@ -283,6 +283,9 @@ def api_send_message(
         "conversation_title": title,
         "thread_id": real_thread_id,
         "stream": True,
+        # Browser's IANA timezone (e.g. "America/New_York") so the backend can
+        # localize the system clock injected into the prompt to the user's location.
+        "user_timezone": getattr(st.context, "timezone", None),
     }
     url = f"{_base()}/message/{assistant_id}"
     if attachments:
