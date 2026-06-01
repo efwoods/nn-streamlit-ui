@@ -9,7 +9,6 @@ Run with:
 import base64
 import json
 import io
-import time
 import uuid
 import requests
 from datetime import datetime
@@ -20,6 +19,13 @@ import os
 from collections.abc import Callable
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
+
+from thread_recovery import (
+    apply_recovered_messages,
+    convert_lg_messages,
+    is_recoverable_send_failure,
+    resolve_thread_id_after_send_failure,
+)
 
 load_dotenv()
 
@@ -318,29 +324,6 @@ def api_send_message(
         )
     resp.raise_for_status()
     ct = (resp.headers.get("Content-Type") or "").lower()
-    # #region agent log
-    try:
-        with open("/home/user/gh/anubis/frontend/.cursor/debug-0d481b.log", "a") as _df:
-            _df.write(
-                json.dumps(
-                    {
-                        "sessionId": "0d481b",
-                        "timestamp": int(time.time() * 1000),
-                        "hypothesisId": "H1-H3",
-                        "location": "studio_chat_app.py:api_send_message",
-                        "message": "POST /message streaming response",
-                        "data": {
-                            "status": resp.status_code,
-                            "content_type": resp.headers.get("Content-Type", ""),
-                            "sse": "event-stream" in ct,
-                        },
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    # #endregion
     try:
         if "event-stream" in ct:
             return consume_streaming_message_response(resp, on_stream_chunk)
@@ -446,19 +429,68 @@ def _json_export_sanitize(obj):
     return obj
 
 
-def convert_lg_messages(lg_messages: list) -> list:
-    """Map LangGraph {type:'human'|'ai'} messages to {role:'user'|'assistant'}."""
-    result = []
-    for msg in (lg_messages or []):
-        t = msg.get("type", "")
-        if t in ("human", "ai"):
-            result.append({
-                "role": "user" if t == "human" else "assistant",
-                "content": msg.get("content", ""),
-                "id": msg.get("id"),
-                "response_time_ms": None,
-            })
-    return result
+def refresh_thread_after_send_failure(
+    pending_thread_id: str | None,
+    *,
+    partial_result: dict | None = None,
+) -> tuple[str, list] | None:
+    """Re-fetch conversations + messages so UI matches backend after a timeout.
+
+    Returns ``(thread_id, ui_messages)`` or ``None`` if refresh failed.
+    """
+    if not (st.session_state.api_key or "").strip():
+        return None
+    try:
+        threads = fetch_threads(assistant_id)
+        st.session_state.backend_threads = threads
+        st.session_state.threads_loaded = True
+
+        tid = resolve_thread_id_after_send_failure(
+            pending_thread_id, threads, partial_result
+        )
+        if not tid:
+            return None
+
+        raw = fetch_thread_messages(tid, assistant_id)
+        return tid, convert_lg_messages(raw)
+    except Exception:
+        return None
+
+
+def apply_recovered_thread_messages(
+    pending_thread_id: str | None,
+    final_tid: str,
+    messages: list,
+) -> None:
+    """Replace local thread cache with authoritative backend messages."""
+    apply_recovered_messages(
+        st.session_state.thread_messages,
+        pending_thread_id=pending_thread_id,
+        final_tid=final_tid,
+        messages=messages,
+    )
+    st.session_state.active_thread_id = final_tid
+    _sync_thread_id_query_param(final_tid)
+
+
+def try_recover_thread_after_send_failure(
+    pending_thread_id: str | None,
+    exc: BaseException,
+    *,
+    partial_result: dict | None = None,
+) -> bool:
+    """On gateway timeout / stream drop, reload thread from backend. Returns True if recovered."""
+    if not is_recoverable_send_failure(exc):
+        return False
+    recovered = refresh_thread_after_send_failure(
+        pending_thread_id, partial_result=partial_result
+    )
+    if not recovered:
+        return False
+    final_tid, messages = recovered
+    apply_recovered_thread_messages(pending_thread_id, final_tid, messages)
+    return True
+
 
 def get_thread_title(thread: dict | None, thread_id: str) -> str:
     """Resolve display title: local override → backend metadata → formatted date."""
@@ -1147,48 +1179,58 @@ if _pending_send and _pending_send.get("tid") == tid:
 
             st.session_state.pop("_studio_pending_send", None)
 
-        except requests.exceptions.ConnectionError:
-            st.session_state.pop("_studio_pending_send", None)
-            st.error(
-                f"❌ Could not connect to `{st.session_state.base_url}`. Is the server running?"
-            )
+        except requests.exceptions.ConnectionError as exc:
+            if try_recover_thread_after_send_failure(_ptid, exc):
+                st.session_state.pop("_studio_pending_send", None)
+                st.warning(
+                    "⚠️ Connection dropped while waiting for a reply. "
+                    "Reloaded this conversation from the server — check for a response below."
+                )
+                st.rerun()
+            else:
+                st.session_state.pop("_studio_pending_send", None)
+                st.error(
+                    f"❌ Could not connect to `{st.session_state.base_url}`. Is the server running?"
+                )
         except requests.exceptions.HTTPError as exc:
-            st.session_state.pop("_studio_pending_send", None)
             status = exc.response.status_code if exc.response is not None else "?"
-            detail = ""
-            try:
-                detail = exc.response.json().get("detail", "")
-            except Exception:
-                pass
-            st.error(f"❌ HTTP {status}: {detail or str(exc)}")
-        except requests.exceptions.Timeout:
-            st.session_state.pop("_studio_pending_send", None)
-            st.error("❌ Request timed out. The server may be overloaded.")
+            if try_recover_thread_after_send_failure(_ptid, exc):
+                st.session_state.pop("_studio_pending_send", None)
+                st.warning(
+                    f"⚠️ HTTP {status} (gateway timeout). "
+                    "Reloaded this conversation from the server — your message may already be there."
+                )
+                st.rerun()
+            else:
+                st.session_state.pop("_studio_pending_send", None)
+                detail = ""
+                try:
+                    detail = exc.response.json().get("detail", "")
+                except Exception:
+                    pass
+                st.error(f"❌ HTTP {status}: {detail or str(exc)}")
+        except requests.exceptions.Timeout as exc:
+            if try_recover_thread_after_send_failure(_ptid, exc):
+                st.session_state.pop("_studio_pending_send", None)
+                st.warning(
+                    "⚠️ Request timed out. "
+                    "Reloaded this conversation from the server — your message may already be there."
+                )
+                st.rerun()
+            else:
+                st.session_state.pop("_studio_pending_send", None)
+                st.error("❌ Request timed out. The server may be overloaded.")
         except Exception as exc:
-            # #region agent log
-            try:
-                with open("/home/user/gh/anubis/frontend/.cursor/debug-0d481b.log", "a") as _df:
-                    _df.write(
-                        json.dumps(
-                            {
-                                "sessionId": "0d481b",
-                                "timestamp": int(time.time() * 1000),
-                                "hypothesisId": "H4-H5",
-                                "location": "studio_chat_app.py:pending_send",
-                                "message": "unexpected exception in send flow",
-                                "data": {
-                                    "exc_type": type(exc).__name__,
-                                    "exc_repr": repr(exc)[:500],
-                                },
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            # #endregion
-            st.session_state.pop("_studio_pending_send", None)
-            st.error(f"❌ Unexpected error: {exc}")
+            if try_recover_thread_after_send_failure(_ptid, exc):
+                st.session_state.pop("_studio_pending_send", None)
+                st.warning(
+                    "⚠️ Send failed but the server may have saved your message. "
+                    "Reloaded this conversation from the server."
+                )
+                st.rerun()
+            else:
+                st.session_state.pop("_studio_pending_send", None)
+                st.error(f"❌ Unexpected error: {exc}")
 
 # ── Message composer: one row [attach | type message | send] + preview inside form ──
 composer_disabled = bool(errors)
