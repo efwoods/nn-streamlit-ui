@@ -82,6 +82,8 @@ DEFAULTS = {
     # Full data URI or https URL for assistant avatar (from GET /avatar_reference_image)
     "assistant_reference_icon": None,
     "_ref_icon_cache_key": None,
+    # Bounded retries so a not-yet-ready reference image is refetched, not pinned to 🤖
+    "_ref_icon_attempts": 0,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -140,7 +142,7 @@ def fetch_avatar_reference_icon() -> str | None:
         headers["api-key"] = ak
     resp = requests.get(
         f"{_base()}/avatar_reference_image",
-        headers=_headers(),
+        headers=headers,
         params={"assistant_id": assistant_id},
         timeout=15,
     )
@@ -199,6 +201,10 @@ def _accumulate_sse_message_obj(obj: dict, streamed_parts: list[str], merged: di
         if t is not None:
             streamed_parts.append(str(t))
             hit = True
+    # A human-in-the-loop pause (e.g. correct_identity_fact) arrives as an
+    # ``interrupt`` event carrying the approve/edit/reject preview instead of ``done``.
+    if obj.get("type") == "interrupt" and obj.get("interrupt") is not None:
+        merged["interrupt"] = obj["interrupt"]
     for k in ("content", "thread_id", "total_response_time_ms", "response_metadata"):
         if k in obj and obj[k] is not None:
             merged[k] = obj[k]
@@ -322,6 +328,51 @@ def api_send_message(
             stream=True,
             timeout=None,
         )
+    resp.raise_for_status()
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    try:
+        if "event-stream" in ct:
+            return consume_streaming_message_response(resp, on_stream_chunk)
+        if "application/json" in ct:
+            return resp.json()
+        return _parse_message_sse_body(resp.text or "")
+    finally:
+        resp.close()
+
+
+def api_resume_message(
+    thread_id: str,
+    decision: str,
+    *,
+    corrected_information: str | None = None,
+    correction_context: str | None = None,
+    on_stream_chunk: Callable[[str], None] | None = None,
+) -> dict:
+    """POST /message/{assistant_id}/resume — continue a run paused for approval.
+
+    ``decision`` is ``approve`` | ``edit`` | ``reject``. For ``edit``, the owner's
+    revised fact/context are forwarded. Returns the same merged dict shape as
+    ``api_send_message`` (and may itself carry another ``interrupt``).
+    """
+    payload = {
+        "thread_id": thread_id,
+        "decision": decision,
+        "your_name": st.session_state.user_name or None,
+        "your_description": st.session_state.user_description or None,
+        "user_timezone": getattr(st.context, "timezone", None),
+    }
+    if corrected_information is not None:
+        payload["corrected_information"] = corrected_information
+    if correction_context is not None:
+        payload["correction_context"] = correction_context
+
+    resp = requests.post(
+        f"{_base()}/message/{assistant_id}/resume",
+        headers=_headers(),
+        data={k: v for k, v in payload.items() if v is not None},
+        stream=True,
+        timeout=None,
+    )
     resp.raise_for_status()
     ct = (resp.headers.get("Content-Type") or "").lower()
     try:
@@ -547,6 +598,7 @@ def assistant_chat_avatar() -> str:
 def invalidate_avatar_icon_cache() -> None:
     """Force GET /avatar_reference_image on next render (e.g. after upload)."""
     st.session_state._ref_icon_cache_key = None
+    st.session_state._ref_icon_attempts = 0
 
 
 def _toggle_settings() -> None:
@@ -601,16 +653,6 @@ def build_share_url() -> str:
 has_api_key = bool(st.session_state.api_key.strip())
 cfg_ok = bool(st.session_state.base_url.strip() and assistant_id)
 
-# ── 0. Reference portrait for assistant avatar (works for anonymous chat too) ──
-if cfg_ok:
-    _rk = f"{assistant_id}:{st.session_state.api_key}"
-    if st.session_state.get("_ref_icon_cache_key") != _rk:
-        try:
-            st.session_state.assistant_reference_icon = fetch_avatar_reference_icon()
-        except Exception:
-            st.session_state.assistant_reference_icon = None
-        st.session_state._ref_icon_cache_key = _rk
-
 # ── 1. Resolve user_id (no api_key required) ──
 if not st.session_state.user_id and cfg_ok:
     try:
@@ -627,6 +669,31 @@ if has_api_key and st.session_state.last_loaded_api_key != st.session_state.api_
     st.session_state.pending_auto_message = None
     st.session_state.last_loaded_api_key = st.session_state.api_key
     st.session_state._ref_icon_cache_key = None
+
+# ── 2b. Reference portrait for assistant avatar (works for anonymous + logged-in) ──
+# Fetch the assistant's reference image and cache it for the session. Only a *successful*
+# (non-empty) result is cached; an empty/failed fetch — e.g. the backend has not finished
+# deriving the portrait on a cold open — is retried on later reruns instead of being
+# pinned to the 🤖 fallback until a hard browser refresh. A small attempt cap avoids
+# re-hitting the endpoint forever for assistants that legitimately have no portrait.
+if cfg_ok:
+    _rk = f"{assistant_id}:{(st.session_state.api_key or '').strip()}:refimg-v3"
+    if st.session_state.get("_ref_icon_cache_key") != _rk:
+        # New assistant/api-key → reset cache + retry budget.
+        st.session_state._ref_icon_cache_key = _rk
+        st.session_state._ref_icon_attempts = 0
+        st.session_state.assistant_reference_icon = None
+    if (
+        not st.session_state.get("assistant_reference_icon")
+        and st.session_state.get("_ref_icon_attempts", 0) < 5
+    ):
+        st.session_state._ref_icon_attempts = st.session_state.get("_ref_icon_attempts", 0) + 1
+        try:
+            _icon = fetch_avatar_reference_icon()
+        except Exception:
+            _icon = None
+        if _icon:
+            st.session_state.assistant_reference_icon = _icon
 
 # ── 3. API-key mode: load threads + restore active thread ──
 if has_api_key and cfg_ok:
@@ -1129,55 +1196,70 @@ if _pending_send and _pending_send.get("tid") == tid:
                 attachments=_files_payload,
                 on_stream_chunk=_show_chunk,
             )
-            reply = result.get("content", "(empty response)")
-            # Final render (covers responses with only a terminal ``content`` field, no tokens)
-            stream_slot.markdown(reply)
-            resp_time = result.get("total_response_time_ms")
-            returned_tid = result.get("thread_id")
+            if isinstance(result, dict) and result.get("interrupt"):
+                # Paused for human approval (e.g. a fact correction). Hand off to the
+                # approve/edit/reject panel rendered below; do NOT finalize a reply.
+                # Keep the UI thread key as-is; the backend thread_id is carried for
+                # the resume call and the thread migrates on final completion.
+                st.session_state["_studio_pending_interrupt"] = {
+                    "tid": _ptid,
+                    "thread_id": result.get("thread_id") or _ptid,
+                    "interrupt": result["interrupt"],
+                }
+                stream_slot.caption("✏️ Awaiting your confirmation on a correction…")
+                st.session_state.pop("_studio_pending_send", None)
+                result = None
 
-            if resp_time:
-                st.markdown(
-                    f'<span class="resp-time">⏱ {resp_time} ms</span>',
-                    unsafe_allow_html=True,
-                )
+            if result is not None:
+                reply = result.get("content", "(empty response)")
+                # Final render (covers responses with only a terminal ``content`` field, no tokens)
+                stream_slot.markdown(reply)
+                resp_time = result.get("total_response_time_ms")
+                returned_tid = result.get("thread_id")
 
-            _msgs = st.session_state.thread_messages.get(_ptid, [])
-            _msgs.append({
-                "role": "assistant",
-                "content": reply,
-                "response_time_ms": resp_time,
-                "metadata": result.get("response_metadata", {}),
-            })
+                if resp_time:
+                    st.markdown(
+                        f'<span class="resp-time">⏱ {resp_time} ms</span>',
+                        unsafe_allow_html=True,
+                    )
 
-            final_tid = returned_tid or _ptid
+                _msgs = st.session_state.thread_messages.get(_ptid, [])
+                _msgs.append({
+                    "role": "assistant",
+                    "content": reply,
+                    "response_time_ms": resp_time,
+                    "metadata": result.get("response_metadata", {}),
+                })
 
-            if final_tid:
-                if _ptid == NEW_THREAD or _ptid is None or _ptid != final_tid:
-                    st.session_state.thread_messages[final_tid] = _msgs
-                    if _ptid in st.session_state.thread_messages and _ptid != final_tid:
-                        del st.session_state.thread_messages[_ptid]
+                final_tid = returned_tid or _ptid
+
+                if final_tid:
+                    if _ptid == NEW_THREAD or _ptid is None or _ptid != final_tid:
+                        st.session_state.thread_messages[final_tid] = _msgs
+                        if _ptid in st.session_state.thread_messages and _ptid != final_tid:
+                            del st.session_state.thread_messages[_ptid]
+                        st.session_state.active_thread_id = final_tid
+
+                        if has_api_key and cfg_ok:
+                            try:
+                                st.session_state.backend_threads = fetch_threads(assistant_id)
+                            except Exception:
+                                pass
+
+                    if final_tid not in st.session_state.conversation_titles:
+                        title_src = _text_p if _text_p else (
+                            _raw_atts[0]["name"] if _raw_atts else ""
+                        )
+                        short = title_src[:45] + ("…" if len(title_src) > 45 else "")
+                        st.session_state.conversation_titles[final_tid] = short
+
+                if not st.session_state.active_thread_id:
                     st.session_state.active_thread_id = final_tid
 
-                    if has_api_key and cfg_ok:
-                        try:
-                            st.session_state.backend_threads = fetch_threads(assistant_id)
-                        except Exception:
-                            pass
+                if _raw_atts:
+                    st.session_state.attachment_uploader_bump += 1
 
-                if final_tid not in st.session_state.conversation_titles:
-                    title_src = _text_p if _text_p else (
-                        _raw_atts[0]["name"] if _raw_atts else ""
-                    )
-                    short = title_src[:45] + ("…" if len(title_src) > 45 else "")
-                    st.session_state.conversation_titles[final_tid] = short
-
-            if not st.session_state.active_thread_id:
-                st.session_state.active_thread_id = final_tid
-
-            if _raw_atts:
-                st.session_state.attachment_uploader_bump += 1
-
-            st.session_state.pop("_studio_pending_send", None)
+                st.session_state.pop("_studio_pending_send", None)
 
         except requests.exceptions.ConnectionError as exc:
             if try_recover_thread_after_send_failure(_ptid, exc):
@@ -1231,6 +1313,107 @@ if _pending_send and _pending_send.get("tid") == tid:
             else:
                 st.session_state.pop("_studio_pending_send", None)
                 st.error(f"❌ Unexpected error: {exc}")
+
+# ── Pending resume (approve/edit/reject was chosen → continue the paused run) ──
+_pending_resume = st.session_state.get("_studio_pending_resume")
+if _pending_resume:
+    _rtid = _pending_resume["tid"]
+    with st.chat_message("assistant", avatar=assistant_chat_avatar()):
+        stream_slot = st.empty()
+        stream_slot.caption("Applying…")
+        try:
+            def _show_chunk(text_so_far: str) -> None:
+                stream_slot.markdown(text_so_far)
+
+            result = api_resume_message(
+                _pending_resume["thread_id"],
+                _pending_resume["decision"],
+                corrected_information=_pending_resume.get("corrected_information"),
+                correction_context=_pending_resume.get("correction_context"),
+                on_stream_chunk=_show_chunk,
+            )
+            if isinstance(result, dict) and result.get("interrupt"):
+                # The continuation paused again (another correction) → re-open the panel.
+                st.session_state["_studio_pending_interrupt"] = {
+                    "tid": _rtid,
+                    "thread_id": result.get("thread_id") or _pending_resume["thread_id"],
+                    "interrupt": result["interrupt"],
+                }
+                stream_slot.caption("✏️ Awaiting your confirmation on a correction…")
+                st.session_state.pop("_studio_pending_resume", None)
+            else:
+                reply = result.get("content", "(empty response)")
+                stream_slot.markdown(reply)
+                resp_time = result.get("total_response_time_ms")
+                if resp_time:
+                    st.markdown(
+                        f'<span class="resp-time">⏱ {resp_time} ms</span>',
+                        unsafe_allow_html=True,
+                    )
+                _msgs = st.session_state.thread_messages.get(_rtid, [])
+                _msgs.append({
+                    "role": "assistant",
+                    "content": reply,
+                    "response_time_ms": resp_time,
+                    "metadata": result.get("response_metadata", {}),
+                })
+                st.session_state.thread_messages[_rtid] = _msgs
+                st.session_state.pop("_studio_pending_resume", None)
+        except Exception as exc:
+            # Resume failures get the same backend-reload recovery as a normal send.
+            if try_recover_thread_after_send_failure(_rtid, exc):
+                st.session_state.pop("_studio_pending_resume", None)
+                st.warning(
+                    "⚠️ Connection dropped while applying the correction. "
+                    "Reloaded this conversation from the server — check below."
+                )
+                st.rerun()
+            else:
+                st.session_state.pop("_studio_pending_resume", None)
+                st.error(f"❌ Could not apply the correction: {exc}")
+
+# ── Approve/edit/reject panel for a paused fact correction (human-in-the-loop) ──
+_pending_interrupt = st.session_state.get("_studio_pending_interrupt")
+if _pending_interrupt:
+    _intr = _pending_interrupt.get("interrupt") or {}
+    _proposed = _intr.get("proposed") or {}
+    _matches = _intr.get("matches") or []
+    with st.chat_message("assistant", avatar=assistant_chat_avatar()):
+        st.markdown("**✏️ I found existing fact(s) to correct — please confirm:**")
+        if _intr.get("inaccurate_information"):
+            st.caption(f"You flagged as inaccurate: _{_intr['inaccurate_information']}_")
+        if _matches:
+            st.markdown("Matched fact(s) that will be replaced:")
+            for _m in _matches:
+                _cur = _m.get("current_fact") or _m.get("page_content") or "(unnamed)"
+                st.markdown(f"- `{_cur}`")
+        edited_fact = st.text_area(
+            "Corrected fact",
+            value=_proposed.get("corrected_information", ""),
+            key="interrupt_edit_fact",
+        )
+        edited_ctx = st.text_area(
+            "Context",
+            value=_proposed.get("correction_context", ""),
+            key="interrupt_edit_ctx",
+        )
+        col_a, col_e, col_r = st.columns(3)
+        _approve = col_a.button("✅ Approve", key="interrupt_approve", use_container_width=True)
+        _edit = col_e.button("✏️ Apply edit", key="interrupt_edit", use_container_width=True)
+        _reject = col_r.button("🚫 Reject", key="interrupt_reject", use_container_width=True)
+        if _approve or _edit or _reject:
+            _decision = "approve" if _approve else ("edit" if _edit else "reject")
+            _resume = {
+                "tid": _pending_interrupt["tid"],
+                "thread_id": _pending_interrupt["thread_id"],
+                "decision": _decision,
+            }
+            if _edit:
+                _resume["corrected_information"] = edited_fact
+                _resume["correction_context"] = edited_ctx
+            st.session_state["_studio_pending_resume"] = _resume
+            st.session_state.pop("_studio_pending_interrupt", None)
+            st.rerun()
 
 # ── Message composer: one row [attach | type message | send] + preview inside form ──
 composer_disabled = bool(errors)
