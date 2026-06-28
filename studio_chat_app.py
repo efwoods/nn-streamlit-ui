@@ -211,6 +211,20 @@ def _accumulate_sse_message_obj(obj: dict, streamed_parts: list[str], merged: di
     return hit
 
 
+def _streamed_text_is_internal_json(text: str) -> bool:
+    """True when live-streamed text is leaked structured output, not a prose reply.
+
+    During a human-in-the-loop fact correction the backend currently streams the
+    per-document analysis (``ProposedFactEdit``: ``asserts_inaccurate_fact`` /
+    ``corrected_text`` / ``corrected_context``) through the same ``assistant_token``
+    channel as a normal reply, and runs several of those analyses concurrently — so the
+    JSON arrives interleaved/garbled. None of that is a user-facing reply, so it should
+    never be rendered directly. A real avatar reply is natural language; a leaked
+    structured-output chunk begins with ``{`` or ``[``.
+    """
+    return (text or "").lstrip()[:1] in ("{", "[")
+
+
 def _finalize_merged_message(streamed_parts: list[str], merged: dict) -> dict:
     text = "".join(streamed_parts)
     if text and not merged.get("content"):
@@ -1188,7 +1202,14 @@ if _pending_send and _pending_send.get("tid") == tid:
         stream_slot.caption("Thinking…")
         try:
             def _show_chunk(text_so_far: str) -> None:
-                stream_slot.markdown(text_so_far)
+                # A fact-correction turn streams internal structured-output JSON (often
+                # several analyses interleaved) before it resolves into the approve/edit/
+                # reject panel below. Don't render that raw — hold a placeholder until the
+                # turn is ready to display properly.
+                if _streamed_text_is_internal_json(text_so_far):
+                    stream_slot.caption("✏️ Suggesting edits…")
+                else:
+                    stream_slot.markdown(text_so_far)
 
             result = api_send_message(
                 _text_p,
@@ -1323,7 +1344,14 @@ if _pending_resume:
         stream_slot.caption("Applying…")
         try:
             def _show_chunk(text_so_far: str) -> None:
-                stream_slot.markdown(text_so_far)
+                # A fact-correction turn streams internal structured-output JSON (often
+                # several analyses interleaved) before it resolves into the approve/edit/
+                # reject panel below. Don't render that raw — hold a placeholder until the
+                # turn is ready to display properly.
+                if _streamed_text_is_internal_json(text_so_far):
+                    stream_slot.caption("✏️ Suggesting edits…")
+                else:
+                    stream_slot.markdown(text_so_far)
 
             result = api_resume_message(
                 _pending_resume["thread_id"],
