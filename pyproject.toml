@@ -11,5 +11,8 @@ dependencies = [
     "pillow>=10.0.0",
 ]
 
+[dependency-groups]
+dev = ["debugpy>=1.8.0"]
+
 [tool.uv]
 package = false
