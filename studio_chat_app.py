@@ -379,10 +379,11 @@ def api_resume_message(
 
     ``decision`` is ``apply`` | ``cancel``. ``items`` carries the owner's per-document
     decisions (one entry per matched document: ``index`` + an ``action`` ∈
-    ``skip`` | ``accept`` | ``edit`` | ``remove``, plus ``corrected_text`` /
-    ``correction_context`` when the action is ``edit``). Any document the owner leaves alone
-    defaults to ``skip`` server-side, so it is never silently changed. Returns the same merged
-    dict shape as ``api_send_message`` (and may itself carry another ``interrupt``).
+    ``accept`` ("Accept Edit") | ``remove`` ("Remove the Document") | ``skip`` ("Leave the
+    document unchanged"), plus ``corrected_text`` / ``correction_context`` — the editable
+    window applied on ``accept``). Any document the owner leaves alone defaults to ``skip``
+    server-side, so it is never silently changed. Returns the same merged dict shape as
+    ``api_send_message`` (and may itself carry another ``interrupt``).
     """
     payload = {
         "thread_id": thread_id,
@@ -1426,20 +1427,24 @@ if _pending_resume:
                 st.error(f"❌ Could not apply the correction: {exc}")
 
 # ── Per-document action panel for a paused fact correction (human-in-the-loop) ──
-# Each matched document is its own item with FOUR explicit choices; the default is "leave
-# unchanged" so anything retrieved by mistake is never touched unless the owner acts on it.
+# Each matched document is its own item with THREE explicit choices: "Accept Edit" applies the
+# editable window, "Remove the Document" deletes/redacts it, "Leave the document unchanged" is
+# the safe default. The radio is PRE-SELECTED to the backend's ``recommended_action`` (a loose
+# match recommends "leave unchanged", so a false positive is never pre-armed for a change).
 # "Apply my choices" applies each item's action; "Cancel correction" abandons everything.
-_ACTION_ORDER = ["skip", "accept", "edit", "remove"]
+_ACTION_ORDER = ["accept", "remove", "skip"]
+# Fallback labels if the payload omits ``action_labels``; the backend now ships its own.
 _ACTION_LABELS = {
-    "skip": "🚫 Leave unchanged",
-    "accept": "✅ Accept suggested edit",
-    "edit": "✏️ Edit it myself",
-    "remove": "🗑️ Remove it",
+    "accept": "✅ Accept Edit",
+    "remove": "🗑️ Remove the Document",
+    "skip": "🚫 Leave the document unchanged",
 }
 _pending_interrupt = st.session_state.get("_studio_pending_interrupt")
 if _pending_interrupt:
     _intr = _pending_interrupt.get("interrupt") or {}
     _matches = _intr.get("matches") or []
+    # Prefer the backend-supplied labels so the panel always matches the server's vocabulary.
+    _action_labels = {**_ACTION_LABELS, **(_intr.get("action_labels") or {})}
     with st.chat_message("assistant", avatar=assistant_chat_avatar()):
         st.markdown(
             f"**✏️ I found {len(_matches)} stored item(s) that might match — choose what to do with each.**"
@@ -1447,8 +1452,9 @@ if _pending_interrupt:
         if _intr.get("inaccurate_information"):
             st.caption(f"You flagged as inaccurate: _{_intr['inaccurate_information']}_")
         st.caption(
-            "Every item defaults to **Leave unchanged**, so anything retrieved by mistake "
-            "stays exactly as-is unless you pick another action."
+            "Each item is pre-selected to my recommendation; you can change any of them. "
+            "Anything I recommend leaving unchanged stays exactly as-is unless you pick "
+            "another action."
         )
 
         with st.form("interrupt_corrections"):
@@ -1457,47 +1463,59 @@ if _pending_interrupt:
                 _idx = _m.get("index")
                 _ns = "/".join(str(p) for p in (_m.get("namespace") or []))
                 _kind = _m.get("kind", "fact")
-                _current = _m.get("current_text") or "(unnamed)"
-                _suggested = _m.get("suggested_text", "")
+                _current = _m.get("current_fact_content") or "(unnamed)"
+                # Suggested edit is populated by the backend ONLY when the recommendation is to
+                # edit (empty for leave-unchanged / remove); it pre-fills the editable window.
+                _suggested = _m.get("suggested_edit_fact_content", "")
+                _suggested_ctx = _m.get("suggested_edit_fact_context", "")
                 _recommended = _m.get("recommended_action") or "skip"
                 if _recommended not in _ACTION_ORDER:
                     _recommended = "skip"
+                _doc_id = _m.get("document_id") or _m.get("key") or "(no id)"
                 with st.container(border=True):
                     _label = "sentence in quote/long text" if _kind == "sentence" else "fact"
                     # Surface the match score so loose/false-positive matches are easy to spot
                     # (a low score usually means the document was swept in by a loose semantic
                     # match and should be left unchanged).
-                    _score = _m.get("score")
-                    _score_txt = f" · match {_score:.0%}" if isinstance(_score, (int, float)) else ""
+                    _pct = _m.get("match_percent")
+                    if not isinstance(_pct, (int, float)):
+                        _score = _m.get("score")
+                        _pct = round(_score * 100) if isinstance(_score, (int, float)) else None
+                    _score_txt = f" · match {_pct}%" if _pct is not None else ""
                     st.caption(f"📄 {_ns} · {_label}{_score_txt}")
-                    st.markdown(f"**Current:** `{_current}`")
-                    if _m.get("current_context"):
-                        st.caption(f"Original context: {_m['current_context']}")
-                    if _suggested:
+                    # The concrete document id distinguishes otherwise-identical matched facts.
+                    st.caption(f"document_id: `{_doc_id}`")
+                    st.markdown(f"**Current document fact content:** `{_current}`")
+                    if _m.get("current_fact_context"):
+                        st.caption(f"Current document fact context: {_m['current_fact_context']}")
+                    if _recommended == "accept" and _suggested:
                         st.markdown(f"**Suggested edit:** `{_suggested}`")
+                    elif _recommended == "remove":
+                        st.caption("💡 I recommend removing this document (it only states the inaccurate event).")
                     else:
-                        st.caption("The suggested edit removes this item (nothing true is left to keep).")
-                    if _recommended != "skip":
-                        st.caption(f"💡 Suggested action: {_ACTION_LABELS[_recommended]}")
-                    # Default selection is always "skip" (index 0): the owner must opt in.
+                        st.caption("💡 I recommend leaving this document unchanged.")
+                    # Pre-select the recommended action (highlighted) so the owner can confirm
+                    # with one click; the safe "leave unchanged" stays the recommendation for
+                    # any loosely-matched document.
                     _action = st.radio(
                         "What should I do with this?",
                         options=_ACTION_ORDER,
-                        format_func=lambda a: _ACTION_LABELS[a],
-                        index=0,
+                        format_func=lambda a: _action_labels.get(a, a),
+                        index=_ACTION_ORDER.index(_recommended),
                         key=f"interrupt_action_{_idx}",
                         horizontal=True,
                     )
-                    # These boxes are used ONLY when the action is "Edit it myself"; they are
-                    # prefilled with the suggestion so an edit starts from a good draft.
+                    # The editable window is what "Accept Edit" applies. It is prefilled with the
+                    # suggested edit so accepting is one click; the owner may rewrite it (the
+                    # backend records an owner-authored edit as ``correction_origin: "user"``).
                     _corrected = st.text_area(
-                        "Your corrected text (used only for “Edit it myself”)",
+                        "Suggested edit fact content (applied when you choose “Accept Edit”)",
                         value=_suggested,
                         key=f"interrupt_text_{_idx}",
                     )
                     _ctx = st.text_area(
-                        "Your context (used only for “Edit it myself”)",
-                        value=_m.get("suggested_context", ""),
+                        "Suggested edit fact context (applied when you choose “Accept Edit”)",
+                        value=_suggested_ctx,
                         key=f"interrupt_ctx_{_idx}",
                     )
                     _form_state.append({
