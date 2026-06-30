@@ -211,6 +211,18 @@ def _accumulate_sse_message_obj(obj: dict, streamed_parts: list[str], merged: di
     return hit
 
 
+# Field names of the per-document fact-correction analysis (``ProposedFactEdit``). When the
+# backend leaks these structured-output calls into the ``assistant_token`` stream it runs
+# several concurrently, so the JSON arrives interleaved — the buffer can even *start* with a
+# prose fragment from inside one object's string value. Matching any of these keys anywhere
+# in the accumulated text identifies the turn as a correction regardless of interleaving.
+_INTERNAL_JSON_MARKERS = (
+    '"asserts_inaccurate_fact"',
+    '"corrected_text"',
+    '"corrected_context"',
+)
+
+
 def _streamed_text_is_internal_json(text: str) -> bool:
     """True when live-streamed text is leaked structured output, not a prose reply.
 
@@ -219,10 +231,12 @@ def _streamed_text_is_internal_json(text: str) -> bool:
     ``corrected_text`` / ``corrected_context``) through the same ``assistant_token``
     channel as a normal reply, and runs several of those analyses concurrently — so the
     JSON arrives interleaved/garbled. None of that is a user-facing reply, so it should
-    never be rendered directly. A real avatar reply is natural language; a leaked
-    structured-output chunk begins with ``{`` or ``[``.
+    never be rendered directly. A real avatar reply is natural language; a leaked chunk
+    either begins with ``{`` / ``[`` or carries one of the correction schema keys.
     """
-    return (text or "").lstrip()[:1] in ("{", "[")
+    if (text or "").lstrip()[:1] in ("{", "["):
+        return True
+    return any(marker in (text or "") for marker in _INTERNAL_JSON_MARKERS)
 
 
 def _finalize_merged_message(streamed_parts: list[str], merged: dict) -> dict:
@@ -1201,12 +1215,18 @@ if _pending_send and _pending_send.get("tid") == tid:
         stream_slot = st.empty()
         stream_slot.caption("Thinking…")
         try:
+            # Latch: once a turn is identified as a leaked fact-correction stream, keep the
+            # placeholder for the rest of it. The interleaved JSON can momentarily look like
+            # prose at the tail, and we must never flip back to dumping the raw buffer.
+            _suppress_stream = {"on": False}
+
             def _show_chunk(text_so_far: str) -> None:
                 # A fact-correction turn streams internal structured-output JSON (often
                 # several analyses interleaved) before it resolves into the approve/edit/
                 # reject panel below. Don't render that raw — hold a placeholder until the
                 # turn is ready to display properly.
-                if _streamed_text_is_internal_json(text_so_far):
+                if _suppress_stream["on"] or _streamed_text_is_internal_json(text_so_far):
+                    _suppress_stream["on"] = True
                     stream_slot.caption("✏️ Suggesting edits…")
                 else:
                     stream_slot.markdown(text_so_far)
@@ -1343,12 +1363,18 @@ if _pending_resume:
         stream_slot = st.empty()
         stream_slot.caption("Applying…")
         try:
+            # Latch: once a turn is identified as a leaked fact-correction stream, keep the
+            # placeholder for the rest of it. The interleaved JSON can momentarily look like
+            # prose at the tail, and we must never flip back to dumping the raw buffer.
+            _suppress_stream = {"on": False}
+
             def _show_chunk(text_so_far: str) -> None:
                 # A fact-correction turn streams internal structured-output JSON (often
                 # several analyses interleaved) before it resolves into the approve/edit/
                 # reject panel below. Don't render that raw — hold a placeholder until the
                 # turn is ready to display properly.
-                if _streamed_text_is_internal_json(text_so_far):
+                if _suppress_stream["on"] or _streamed_text_is_internal_json(text_so_far):
+                    _suppress_stream["on"] = True
                     stream_slot.caption("✏️ Suggesting edits…")
                 else:
                     stream_slot.markdown(text_so_far)
