@@ -1248,7 +1248,7 @@ if _pending_send and _pending_send.get("tid") == tid:
                     "thread_id": result.get("thread_id") or _ptid,
                     "interrupt": result["interrupt"],
                 }
-                stream_slot.caption("✏️ Awaiting your confirmation on a correction…")
+                stream_slot.caption(_interrupt_status_caption(result["interrupt"]))
                 st.session_state.pop("_studio_pending_send", None)
                 result = None
 
@@ -1393,7 +1393,7 @@ if _pending_resume:
                     "thread_id": result.get("thread_id") or _pending_resume["thread_id"],
                     "interrupt": result["interrupt"],
                 }
-                stream_slot.caption("✏️ Awaiting your confirmation on a correction…")
+                stream_slot.caption(_interrupt_status_caption(result["interrupt"]))
                 st.session_state.pop("_studio_pending_resume", None)
             else:
                 reply = result.get("content", "(empty response)")
@@ -1426,6 +1426,14 @@ if _pending_resume:
                 st.session_state.pop("_studio_pending_resume", None)
                 st.error(f"❌ Could not apply the correction: {exc}")
 
+# ── Human-in-the-loop interrupt panels (fact correction, MCP connect, …) ──
+def _interrupt_status_caption(interrupt: dict | None) -> str:
+    """User-facing status line while a graph interrupt is pending."""
+    if (interrupt or {}).get("kind") == "mcp_connect_consent":
+        return "🔗 Awaiting your decision on connecting a data server…"
+    return "✏️ Awaiting your confirmation on a correction…"
+
+
 # ── Per-document action panel for a paused fact correction (human-in-the-loop) ──
 # Each matched document is its own item with THREE explicit choices: "Accept Edit" applies the
 # editable window, "Remove the Document" deletes/redacts it, "Leave the document unchanged" is
@@ -1442,111 +1450,145 @@ _ACTION_LABELS = {
 _pending_interrupt = st.session_state.get("_studio_pending_interrupt")
 if _pending_interrupt:
     _intr = _pending_interrupt.get("interrupt") or {}
-    _matches = _intr.get("matches") or []
-    # Prefer the backend-supplied labels so the panel always matches the server's vocabulary.
-    _action_labels = {**_ACTION_LABELS, **(_intr.get("action_labels") or {})}
-    with st.chat_message("assistant", avatar=assistant_chat_avatar()):
-        st.markdown(
-            f"**✏️ I found {len(_matches)} stored item(s) that might match — choose what to do with each.**"
-        )
-        if _intr.get("inaccurate_information"):
-            st.caption(f"You flagged as inaccurate: _{_intr['inaccurate_information']}_")
-        st.caption(
-            "Each item is pre-selected to my recommendation; you can change any of them. "
-            "Anything I recommend leaving unchanged stays exactly as-is unless you pick "
-            "another action."
-        )
+    if _intr.get("kind") == "mcp_connect_consent":
+        _server = _intr.get("server") or {}
+        with st.chat_message("assistant", avatar=assistant_chat_avatar()):
+            st.markdown(
+                f"**{_intr.get('prompt', 'An MCP data server is available — connect it to this avatar for data analysis?')}**"
+            )
+            st.caption(f"Server: {_server.get('server_name', 'unknown')}")
+            if _server.get("url"):
+                st.caption(f"Tool endpoint: `{_server['url']}`")
+            _roots = _server.get("allowed_roots") or []
+            if _roots:
+                st.caption(f"Allowed data roots: {', '.join(_roots)}")
+            _col_connect, _col_decline = st.columns(2)
+            if _col_connect.button(
+                "✅ Connect for data analysis", use_container_width=True, key="mcp_connect_apply"
+            ):
+                st.session_state["_studio_pending_resume"] = {
+                    "tid": _pending_interrupt["tid"],
+                    "thread_id": _pending_interrupt["thread_id"],
+                    "decision": "apply",
+                }
+                st.session_state.pop("_studio_pending_interrupt", None)
+                st.rerun()
+            if _col_decline.button(
+                "🚫 Not now", use_container_width=True, key="mcp_connect_cancel"
+            ):
+                st.session_state["_studio_pending_resume"] = {
+                    "tid": _pending_interrupt["tid"],
+                    "thread_id": _pending_interrupt["thread_id"],
+                    "decision": "cancel",
+                }
+                st.session_state.pop("_studio_pending_interrupt", None)
+                st.rerun()
+    else:
+        _matches = _intr.get("matches") or []
+        # Prefer the backend-supplied labels so the panel always matches the server's vocabulary.
+        _action_labels = {**_ACTION_LABELS, **(_intr.get("action_labels") or {})}
+        with st.chat_message("assistant", avatar=assistant_chat_avatar()):
+            st.markdown(
+                f"**✏️ I found {len(_matches)} stored item(s) that might match — choose what to do with each.**"
+            )
+            if _intr.get("inaccurate_information"):
+                st.caption(f"You flagged as inaccurate: _{_intr['inaccurate_information']}_")
+            st.caption(
+                "Each item is pre-selected to my recommendation; you can change any of them. "
+                "Anything I recommend leaving unchanged stays exactly as-is unless you pick "
+                "another action."
+            )
 
-        with st.form("interrupt_corrections"):
-            _form_state: list[dict] = []
-            for _m in _matches:
-                _idx = _m.get("index")
-                _ns = "/".join(str(p) for p in (_m.get("namespace") or []))
-                _kind = _m.get("kind", "fact")
-                _current = _m.get("current_fact_content") or "(unnamed)"
-                # Suggested edit is populated by the backend ONLY when the recommendation is to
-                # edit (empty for leave-unchanged / remove); it pre-fills the editable window.
-                _suggested = _m.get("suggested_edit_fact_content", "")
-                _suggested_ctx = _m.get("suggested_edit_fact_context", "")
-                _recommended = _m.get("recommended_action") or "skip"
-                if _recommended not in _ACTION_ORDER:
-                    _recommended = "skip"
-                _doc_id = _m.get("document_id") or _m.get("key") or "(no id)"
-                with st.container(border=True):
-                    _label = "sentence in quote/long text" if _kind == "sentence" else "fact"
-                    # Surface the match score so loose/false-positive matches are easy to spot
-                    # (a low score usually means the document was swept in by a loose semantic
-                    # match and should be left unchanged).
-                    _pct = _m.get("match_percent")
-                    if not isinstance(_pct, (int, float)):
-                        _score = _m.get("score")
-                        _pct = round(_score * 100) if isinstance(_score, (int, float)) else None
-                    _score_txt = f" · match {_pct}%" if _pct is not None else ""
-                    st.caption(f"📄 {_ns} · {_label}{_score_txt}")
-                    # The concrete document id distinguishes otherwise-identical matched facts.
-                    st.caption(f"document_id: `{_doc_id}`")
-                    st.markdown(f"**Current document fact content:** `{_current}`")
-                    if _m.get("current_fact_context"):
-                        st.caption(f"Current document fact context: {_m['current_fact_context']}")
-                    if _recommended == "accept" and _suggested:
-                        st.markdown(f"**Suggested edit:** `{_suggested}`")
-                    elif _recommended == "remove":
-                        st.caption("💡 I recommend removing this document (it only states the inaccurate event).")
-                    else:
-                        st.caption("💡 I recommend leaving this document unchanged.")
-                    # Pre-select the recommended action (highlighted) so the owner can confirm
-                    # with one click; the safe "leave unchanged" stays the recommendation for
-                    # any loosely-matched document.
-                    _action = st.radio(
-                        "What should I do with this?",
-                        options=_ACTION_ORDER,
-                        format_func=lambda a: _action_labels.get(a, a),
-                        index=_ACTION_ORDER.index(_recommended),
-                        key=f"interrupt_action_{_idx}",
-                        horizontal=True,
-                    )
-                    # The editable window is what "Accept Edit" applies. It is prefilled with the
-                    # suggested edit so accepting is one click; the owner may rewrite it (the
-                    # backend records an owner-authored edit as ``correction_origin: "user"``).
-                    _corrected = st.text_area(
-                        "Suggested edit fact content (applied when you choose “Accept Edit”)",
-                        value=_suggested,
-                        key=f"interrupt_text_{_idx}",
-                    )
-                    _ctx = st.text_area(
-                        "Suggested edit fact context (applied when you choose “Accept Edit”)",
-                        value=_suggested_ctx,
-                        key=f"interrupt_ctx_{_idx}",
-                    )
-                    _form_state.append({
-                        "index": _idx,
-                        "action_key": f"interrupt_action_{_idx}",
-                        "text_key": f"interrupt_text_{_idx}",
-                        "ctx_key": f"interrupt_ctx_{_idx}",
-                    })
-            _col_a, _col_r = st.columns(2)
-            _apply = _col_a.form_submit_button("✅ Apply my choices", use_container_width=True)
-            _cancel = _col_r.form_submit_button("🚫 Cancel correction", use_container_width=True)
+            with st.form("interrupt_corrections"):
+                _form_state: list[dict] = []
+                for _m in _matches:
+                    _idx = _m.get("index")
+                    _ns = "/".join(str(p) for p in (_m.get("namespace") or []))
+                    _kind = _m.get("kind", "fact")
+                    _current = _m.get("current_fact_content") or "(unnamed)"
+                    # Suggested edit is populated by the backend ONLY when the recommendation is to
+                    # edit (empty for leave-unchanged / remove); it pre-fills the editable window.
+                    _suggested = _m.get("suggested_edit_fact_content", "")
+                    _suggested_ctx = _m.get("suggested_edit_fact_context", "")
+                    _recommended = _m.get("recommended_action") or "skip"
+                    if _recommended not in _ACTION_ORDER:
+                        _recommended = "skip"
+                    _doc_id = _m.get("document_id") or _m.get("key") or "(no id)"
+                    with st.container(border=True):
+                        _label = "sentence in quote/long text" if _kind == "sentence" else "fact"
+                        # Surface the match score so loose/false-positive matches are easy to spot
+                        # (a low score usually means the document was swept in by a loose semantic
+                        # match and should be left unchanged).
+                        _pct = _m.get("match_percent")
+                        if not isinstance(_pct, (int, float)):
+                            _score = _m.get("score")
+                            _pct = round(_score * 100) if isinstance(_score, (int, float)) else None
+                        _score_txt = f" · match {_pct}%" if _pct is not None else ""
+                        st.caption(f"📄 {_ns} · {_label}{_score_txt}")
+                        # The concrete document id distinguishes otherwise-identical matched facts.
+                        st.caption(f"document_id: `{_doc_id}`")
+                        st.markdown(f"**Current document fact content:** `{_current}`")
+                        if _m.get("current_fact_context"):
+                            st.caption(f"Current document fact context: {_m['current_fact_context']}")
+                        if _recommended == "accept" and _suggested:
+                            st.markdown(f"**Suggested edit:** `{_suggested}`")
+                        elif _recommended == "remove":
+                            st.caption("💡 I recommend removing this document (it only states the inaccurate event).")
+                        else:
+                            st.caption("💡 I recommend leaving this document unchanged.")
+                        # Pre-select the recommended action (highlighted) so the owner can confirm
+                        # with one click; the safe "leave unchanged" stays the recommendation for
+                        # any loosely-matched document.
+                        _action = st.radio(
+                            "What should I do with this?",
+                            options=_ACTION_ORDER,
+                            format_func=lambda a: _action_labels.get(a, a),
+                            index=_ACTION_ORDER.index(_recommended),
+                            key=f"interrupt_action_{_idx}",
+                            horizontal=True,
+                        )
+                        # The editable window is what "Accept Edit" applies. It is prefilled with the
+                        # suggested edit so accepting is one click; the owner may rewrite it (the
+                        # backend records an owner-authored edit as ``correction_origin: "user"``).
+                        _corrected = st.text_area(
+                            "Suggested edit fact content (applied when you choose “Accept Edit”)",
+                            value=_suggested,
+                            key=f"interrupt_text_{_idx}",
+                        )
+                        _ctx = st.text_area(
+                            "Suggested edit fact context (applied when you choose “Accept Edit”)",
+                            value=_suggested_ctx,
+                            key=f"interrupt_ctx_{_idx}",
+                        )
+                        _form_state.append({
+                            "index": _idx,
+                            "action_key": f"interrupt_action_{_idx}",
+                            "text_key": f"interrupt_text_{_idx}",
+                            "ctx_key": f"interrupt_ctx_{_idx}",
+                        })
+                _col_a, _col_r = st.columns(2)
+                _apply = _col_a.form_submit_button("✅ Apply my choices", use_container_width=True)
+                _cancel = _col_r.form_submit_button("🚫 Cancel correction", use_container_width=True)
 
-        if _apply or _cancel:
-            _resume = {
-                "tid": _pending_interrupt["tid"],
-                "thread_id": _pending_interrupt["thread_id"],
-                "decision": "cancel" if _cancel else "apply",
-            }
-            if _apply:
-                _resume["items"] = [
-                    {
-                        "index": _f["index"],
-                        "action": st.session_state.get(_f["action_key"], "skip"),
-                        "corrected_text": st.session_state.get(_f["text_key"], ""),
-                        "correction_context": st.session_state.get(_f["ctx_key"], ""),
-                    }
-                    for _f in _form_state
-                ]
-            st.session_state["_studio_pending_resume"] = _resume
-            st.session_state.pop("_studio_pending_interrupt", None)
-            st.rerun()
+            if _apply or _cancel:
+                _resume = {
+                    "tid": _pending_interrupt["tid"],
+                    "thread_id": _pending_interrupt["thread_id"],
+                    "decision": "cancel" if _cancel else "apply",
+                }
+                if _apply:
+                    _resume["items"] = [
+                        {
+                            "index": _f["index"],
+                            "action": st.session_state.get(_f["action_key"], "skip"),
+                            "corrected_text": st.session_state.get(_f["text_key"], ""),
+                            "correction_context": st.session_state.get(_f["ctx_key"], ""),
+                        }
+                        for _f in _form_state
+                    ]
+                st.session_state["_studio_pending_resume"] = _resume
+                st.session_state.pop("_studio_pending_interrupt", None)
+                st.rerun()
 
 # ── Message composer: one row [attach | type message | send] + preview inside form ──
 composer_disabled = bool(errors)
