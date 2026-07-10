@@ -36,6 +36,13 @@ AUTO_GREETING = "Hey! Please tell me about yourself and what you can do for me."
 # Sentinel for a conversation that hasn't been created on the backend yet
 NEW_THREAD = "__new__"
 
+
+def _interrupt_status_caption(interrupt: dict | None) -> str:
+    """User-facing status line while a graph interrupt is pending."""
+    if (interrupt or {}).get("kind") == "mcp_connect_consent":
+        return "🔗 Awaiting your decision on connecting a data server…"
+    return "✏️ Awaiting your confirmation on a correction…"
+
 # ──────────────────────────────────────────────
 # Page config
 # ──────────────────────────────────────────────
@@ -1426,14 +1433,6 @@ if _pending_resume:
                 st.session_state.pop("_studio_pending_resume", None)
                 st.error(f"❌ Could not apply the correction: {exc}")
 
-# ── Human-in-the-loop interrupt panels (fact correction, MCP connect, …) ──
-def _interrupt_status_caption(interrupt: dict | None) -> str:
-    """User-facing status line while a graph interrupt is pending."""
-    if (interrupt or {}).get("kind") == "mcp_connect_consent":
-        return "🔗 Awaiting your decision on connecting a data server…"
-    return "✏️ Awaiting your confirmation on a correction…"
-
-
 # ── Per-document action panel for a paused fact correction (human-in-the-loop) ──
 # Each matched document is its own item with THREE explicit choices: "Accept Edit" applies the
 # editable window, "Remove the Document" deletes/redacts it, "Leave the document unchanged" is
@@ -1690,5 +1689,3 @@ if should_send:
 
     st.rerun()
 
-
-    
