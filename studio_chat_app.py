@@ -926,7 +926,7 @@ body:has([data-testid="stSidebar"][aria-expanded="false"]) section[data-testid="
 with st.sidebar:
     col_title, col_gear = st.columns([5, 1])
     with col_title:
-        st.markdown("### 🤖 Studio Chat")
+        st.markdown("### 🤖 Studio Chat DIFFERENT")
     with col_gear:
         st.button(
             "⚙️",
