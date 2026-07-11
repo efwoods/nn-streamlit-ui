@@ -1,0 +1,29 @@
+{
+  // Press F5 to launch this. It runs `streamlit run studio_chat_app.py`
+  // under the debugpy debugger so breakpoints in the app work.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Streamlit: studio_chat_app",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "args": [
+        "run",
+        "studio_chat_app.py",
+        "--server.port=8501",
+        // The app selects the assistant from the URL query string. Streamlit
+        // cannot pass query params on launch, so open this once running:
+        //   http://localhost:8501/?assistant_id=<your-assistant-id>
+        "--server.headless=false"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      },
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ]
+}
