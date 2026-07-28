@@ -65,6 +65,33 @@ class ConvertLgMessagesTests(unittest.TestCase):
         self.assertEqual(out[0]["role"], "user")
         self.assertEqual(out[1]["role"], "assistant")
 
+    def test_carries_response_metadata_so_reports_survive_a_reload(self):
+        """Created reports and plots ride on response_metadata; dropping it loses them."""
+        artifacts = [
+            {
+                "name": "plot.png",
+                "mime_type": "image/png",
+                "encoding": "base64",
+                "content": "aGVsbG8=",
+                "size_bytes": 5,
+            }
+        ]
+        out = tr.convert_lg_messages(
+            [
+                {
+                    "type": "ai",
+                    "content": "Your step count is trending down.",
+                    "id": "2",
+                    "response_metadata": {"created_artifacts": artifacts},
+                }
+            ]
+        )
+        self.assertEqual(out[0]["metadata"]["created_artifacts"], artifacts)
+
+    def test_metadata_defaults_to_empty_dict(self):
+        out = tr.convert_lg_messages([{"type": "ai", "content": "hi", "id": "1"}])
+        self.assertEqual(out[0]["metadata"], {})
+
 
 class SimulatedSendFlowTests(unittest.TestCase):
     """Simulate POST /message failing with 524 then pulling the thread."""

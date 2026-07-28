@@ -466,6 +466,68 @@ def _render_user_chat_content(msg: dict) -> None:
     elif att:
         st.caption("_Attachment only._")
 
+
+def _artifact_bytes(artifact: dict) -> bytes | None:
+    """Raw bytes of one created artifact, or None when nothing was inlined.
+
+    The backend inlines binary artifacts (plots) base64-encoded and text
+    artifacts (reports) verbatim; oversized artifacts arrive with no content at
+    all and stay available only in the avatar's durable storage.
+    """
+    content = artifact.get("content")
+    if content is None:
+        return None
+    try:
+        if artifact.get("encoding") == "base64":
+            return base64.standard_b64decode(content)
+        return str(content).encode("utf-8")
+    except Exception:
+        return None
+
+
+def _render_created_artifacts(msg: dict, key_prefix: str) -> None:
+    """Assistant bubble tail: the reports and plots the turn produced.
+
+    The avatar's data-analysis capability writes a report and a plot per
+    analysis turn and saves them to durable storage; the backend inlines them
+    on the reply's ``response_metadata``. Rendering them here is what turns a
+    prose summary into the actual chart and report the user asked for.
+    """
+    artifacts = (msg.get("metadata") or {}).get("created_artifacts") or []
+    for position, artifact in enumerate(artifacts):
+        name = artifact.get("name") or "artifact"
+        mime = artifact.get("mime_type") or ""
+        data = _artifact_bytes(artifact)
+
+        if data is None:
+            size_kb = (artifact.get("size_bytes") or 0) / 1024.0
+            st.caption(f"📎 {name} — {size_kb:.1f} KB (too large to display here)")
+            continue
+
+        if mime.startswith("image/"):
+            pil = _pil_image_exif_normalized(data)
+            st.image(
+                pil if pil is not None else io.BytesIO(data),
+                caption=name,
+                width="stretch",
+            )
+        elif mime in ("text/markdown", "text/plain"):
+            st.markdown(data.decode("utf-8", errors="replace"))
+        else:
+            size_kb = len(data) / 1024.0
+            st.caption(f"📎 {name} — {size_kb:.1f} KB")
+
+        st.download_button(
+            f"⬇ {name}",
+            data=data,
+            file_name=name,
+            mime=mime or "application/octet-stream",
+            # Streamlit requires widget keys to be unique AND stable across
+            # reruns; the artifact name alone collides when the same report is
+            # regenerated in a later turn of the same thread.
+            key=f"artifact_{key_prefix}_{position}_{name}",
+        )
+
 # ──────────────────────────────────────────────
 # Conversion / display helpers
 # ──────────────────────────────────────────────
@@ -1190,7 +1252,7 @@ if errors:
         st.error(f"⚠️ {e}  — open **⚙️ Settings** in the sidebar to fix this.")
 
 # ── Render existing messages ──
-for msg in messages:
+for _msg_index, msg in enumerate(messages):
     role = msg["role"]
     _av = "🧑" if role == "user" else assistant_chat_avatar()
     with st.chat_message(role, avatar=_av):
@@ -1198,6 +1260,8 @@ for msg in messages:
             _render_user_chat_content(msg)
         else:
             st.markdown(msg["content"])
+        if role == "assistant":
+            _render_created_artifacts(msg, f"{tid}_{_msg_index}")
         if role == "assistant" and msg.get("response_time_ms"):
             st.markdown(
                 f'<span class="resp-time">⏱ {msg["response_time_ms"]} ms</span>',
@@ -1266,19 +1330,24 @@ if _pending_send and _pending_send.get("tid") == tid:
                 resp_time = result.get("total_response_time_ms")
                 returned_tid = result.get("thread_id")
 
+                _msgs = st.session_state.thread_messages.get(_ptid, [])
+                _assistant_msg = {
+                    "role": "assistant",
+                    "content": reply,
+                    "response_time_ms": resp_time,
+                    "metadata": result.get("response_metadata", {}),
+                }
+                # Reports and plots arrive on the terminal frame, never as tokens,
+                # so they can only be rendered once the turn is complete.
+                _render_created_artifacts(_assistant_msg, f"{_ptid}_{len(_msgs)}")
+
                 if resp_time:
                     st.markdown(
                         f'<span class="resp-time">⏱ {resp_time} ms</span>',
                         unsafe_allow_html=True,
                     )
 
-                _msgs = st.session_state.thread_messages.get(_ptid, [])
-                _msgs.append({
-                    "role": "assistant",
-                    "content": reply,
-                    "response_time_ms": resp_time,
-                    "metadata": result.get("response_metadata", {}),
-                })
+                _msgs.append(_assistant_msg)
 
                 final_tid = returned_tid or _ptid
 
@@ -1406,18 +1475,20 @@ if _pending_resume:
                 reply = result.get("content", "(empty response)")
                 stream_slot.markdown(reply)
                 resp_time = result.get("total_response_time_ms")
+                _msgs = st.session_state.thread_messages.get(_rtid, [])
+                _assistant_msg = {
+                    "role": "assistant",
+                    "content": reply,
+                    "response_time_ms": resp_time,
+                    "metadata": result.get("response_metadata", {}),
+                }
+                _render_created_artifacts(_assistant_msg, f"{_rtid}_{len(_msgs)}")
                 if resp_time:
                     st.markdown(
                         f'<span class="resp-time">⏱ {resp_time} ms</span>',
                         unsafe_allow_html=True,
                     )
-                _msgs = st.session_state.thread_messages.get(_rtid, [])
-                _msgs.append({
-                    "role": "assistant",
-                    "content": reply,
-                    "response_time_ms": resp_time,
-                    "metadata": result.get("response_metadata", {}),
-                })
+                _msgs.append(_assistant_msg)
                 st.session_state.thread_messages[_rtid] = _msgs
                 st.session_state.pop("_studio_pending_resume", None)
         except Exception as exc:

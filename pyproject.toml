@@ -5,7 +5,9 @@ description = "Streamlit UI for Neural Nexus"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "streamlit>=1.35.0",
+    # 1.49 is the floor for st.image(width="stretch"), used to render
+    # data-analysis plots. st.context.timezone already required >= 1.42.
+    "streamlit>=1.49.0",
     "requests>=2.31.0",
     "python-dotenv",
     "pillow>=10.0.0",
