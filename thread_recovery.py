@@ -12,7 +12,13 @@ GATEWAY_TIMEOUT_STATUS_CODES = frozenset({502, 503, 504, 524})
 
 
 def convert_lg_messages(lg_messages: list) -> list:
-    """Map LangGraph {type:'human'|'ai'} messages to {role:'user'|'assistant'}."""
+    """Map LangGraph {type:'human'|'ai'} messages to {role:'user'|'assistant'}.
+
+    ``response_metadata`` is carried through as ``metadata`` — the same key the
+    live send path stores it under — because it holds the created data-analysis
+    artifacts (reports and plots). Dropping it here would make every report
+    disappear the moment a thread is reloaded or switched back to.
+    """
     result = []
     for msg in lg_messages or []:
         t = msg.get("type", "")
@@ -22,6 +28,7 @@ def convert_lg_messages(lg_messages: list) -> list:
                 "content": msg.get("content", ""),
                 "id": msg.get("id"),
                 "response_time_ms": None,
+                "metadata": msg.get("response_metadata") or {},
             })
     return result
 
