@@ -1,0 +1,1 @@
+/home/user/gh/anubis-project/Neural-Nexus-Frontend
